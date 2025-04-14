@@ -4,7 +4,7 @@ from lightly.utils import dist
 import torch.nn.functional as F
 
 class Supervised_NTXentLoss(nn.Module):
-    def __init__(self, temperature: float = 0.5, gather_distributed: bool = False):
+    def __init__(self, temperature: float = 0.1, gather_distributed: bool = False):
         '''
         Parameters:
         - temperature (float): Temperature for the ntx-ent loss.

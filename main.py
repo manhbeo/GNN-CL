@@ -1,263 +1,287 @@
-import torch
-import torch.optim as optim
-from torch_geometric.datasets import TUDataset
-from torch_geometric.loader import DataLoader
-from torch_geometric.transforms import OneHotDegree
-
-from models import GIN, SimGRACE
-from supconloss import Supervised_NTXentLoss
-
-import wandb
 import argparse
-import numpy as np
-from sklearn.model_selection import StratifiedKFold
-from sklearn.svm import SVC
-from sklearn.metrics import accuracy_score
-from sklearn.preprocessing import StandardScaler
+import os
+import torch
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning import seed_everything
+from pytorch_lightning.loggers import WandbLogger
+
+from datasets import get_dataset
+from models import GINModule, ResGCN
+from linear_classifier import GraphLinearClassifier
+from graph_loss import SpectralGraphMatchingLoss, AdaptiveSpectralGraphMatchingLoss
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='MUTAG',
-                        choices=['NCI1', 'PROTEINS', 'DD', 'MUTAG', 'COLLAB', 'RDT-B', 'RDT-M5K', 'IMDB-B'])
-    parser.add_argument('--mode', type=str, default='unsupervised',
-                        choices=['unsupervised', 'semi_supervised'])
-    parser.add_argument('--label_rate', type=float, default=0.1,
-                        help='Label rate for semi-supervised learning (0.01 or 0.1)')
-    parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--hidden_dim', type=int, default=32)
-    parser.add_argument('--num_layers', type=int, default=3)
-    parser.add_argument('--lr', type=float, default=0.1)
-    parser.add_argument('--eta', type=float, default=0.1)
-    parser.add_argument('--sigma', type=float, default=0.1)
-    parser.add_argument('--temperature', type=float, default=0.5)
-    parser.add_argument('--wandb_project', type=str, default='simgrace')
-    parser.add_argument('--wandb_entity', type=str, default=None)
-    parser.add_argument('--wandb_name', type=str, default=None)
-    return parser.parse_args()
+def train(args):
+    """
+    Train a graph contrastive learning model.
 
-
-def init_wandb(args):
-    """Initialize wandb with experiment configuration"""
-    config = vars(args)
-    wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=args.wandb_name,
-        config=config
+    Args:
+        args: Command line arguments
+    """
+    # Set up data module
+    data_module = get_dataset(
+        dataset_name=args.dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        root=args.data_dir,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        seed=args.seed
     )
 
+    # Prepare data
+    data_module.prepare_data()
+    data_module.setup()
 
-def train_epoch(model, loader, criterion, optimizer, device, prefix='train'):
-    model.train()
-    total_loss = 0
+    # Get number of input features from dataset
+    num_features = data_module.get_num_features()
 
-    for batch in loader:
-        batch = batch.to(device)
-        optimizer.zero_grad()
+    # Create model
+    if args.model == "gin":
+        model = GINModule(
+            num_features=num_features,
+            hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            dataset=args.dataset,
+            has_graph_loss=args.use_graph_loss,
+            batch_size_per_device=args.batch_size
+        )
+    elif args.model == "resgcn":
+        model = ResGCN(
+            in_channels=num_features,
+            hidden_channels=args.hidden_dim,
+            num_layers=args.num_layers,
+            dropout_rate=args.dropout,
+            learning_rate=args.lr
+        )
+    else:
+        raise ValueError(f"Unknown model: {args.model}")
 
-        z, z_prime = model(batch.x, batch.edge_index, batch.batch)
-        loss = criterion(z, z_prime, batch.y)
+    # Add graph loss if requested
+    if args.use_graph_loss:
+        if args.adaptive_graph_loss:
+            model.graph_loss = AdaptiveSpectralGraphMatchingLoss(
+                percentile=args.percentile,
+                min_edges_percent=args.min_edges,
+                max_edges_percent=args.max_edges,
+                temperature=args.temperature,
+                k_eigvals=args.k_eigvals,
+                gather_distributed=(args.devices > 1)
+            )
+        else:
+            model.graph_loss = SpectralGraphMatchingLoss(
+                similarity_threshold=args.similarity_threshold,
+                temperature=args.temperature,
+                k_eigvals=args.k_eigvals,
+                gather_distributed=(args.devices > 1)
+            )
 
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
+    # Set up logger
+    logger_name = f"{args.model}-{args.dataset}-batch{args.batch_size}"
+    if args.use_graph_loss:
+        logger_name += "-GraphLoss"
 
-    avg_loss = total_loss / len(loader)
-    wandb.log({f'{prefix}_loss': avg_loss})
-    return avg_loss
+    logger = WandbLogger(project="GraphContrastive", name=logger_name)
 
+    # Set up callbacks
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_loss",
+        dirpath=args.checkpoint_dir,
+        filename=f"{args.model}-{args.dataset}-" + "{epoch:02d}-{val_loss:.4f}",
+        save_top_k=3,
+        mode="min"
+    )
 
-def get_embeddings(model, loader, device):
-    model.eval()
-    embeddings = []
-    labels = []
+    lr_monitor = LearningRateMonitor(logging_interval="step")
 
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            z, _ = model(batch.x, batch.edge_index, batch.batch)
-            embeddings.append(z.cpu().numpy())
-            labels.append(batch.y.cpu().numpy())
+    # Set up trainer
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        devices=args.devices,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        strategy="ddp" if args.devices > 1 else "auto",
+        logger=logger,
+        callbacks=[checkpoint_callback, lr_monitor],
+        precision=16 if args.mixed_precision else 32,
+        deterministic=True
+    )
 
-    return np.vstack(embeddings), np.concatenate(labels)
+    # Train model
+    trainer.fit(model, data_module)
 
+    # Save final model
+    final_path = os.path.join(args.checkpoint_dir, f"{args.model}-{args.dataset}-final.ckpt")
+    trainer.save_checkpoint(final_path)
 
-def unsupervised_evaluation(model, dataset, args, device, num_runs=5):
-    """Unsupervised evaluation using SVM with 10-fold CV"""
-    wandb.log({'mode': 'unsupervised'})
-    accuracies = []
-
-    loader = DataLoader(dataset, batch_size=args.batch_size)
-
-    for run in range(num_runs):
-        wandb.log({'run': run})
-        embeddings, labels = get_embeddings(model, loader, device)
-
-        scaler = StandardScaler()
-        embeddings = scaler.fit_transform(embeddings)
-
-        skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=run)
-        fold_accuracies = []
-
-        for fold, (train_idx, test_idx) in enumerate(skf.split(embeddings, labels)):
-            X_train, X_test = embeddings[train_idx], embeddings[test_idx]
-            y_train, y_test = labels[train_idx], labels[test_idx]
-
-            svm = SVC(kernel='rbf')
-            svm.fit(X_train, y_train)
-            acc = svm.score(X_test, y_test)
-            fold_accuracies.append(acc)
-
-            wandb.log({
-                'run': run,
-                'fold': fold,
-                'fold_accuracy': acc
-            })
-
-        run_acc = np.mean(fold_accuracies)
-        accuracies.append(run_acc)
-        wandb.log({
-            'run': run,
-            'run_accuracy': run_acc
-        })
-
-    mean_acc = np.mean(accuracies)
-    std_acc = np.std(accuracies)
-    wandb.log({
-        'final_accuracy': mean_acc,
-        'accuracy_std': std_acc
-    })
-
-    return mean_acc, std_acc
+    return final_path
 
 
-def semi_supervised_evaluation(model, dataset, args, device, num_runs=5):
-    """Semi-supervised evaluation with label rate"""
-    wandb.log({
-        'mode': 'semi_supervised',
-        'label_rate': args.label_rate
-    })
-    accuracies = []
-    k = int(1 / args.label_rate)
+def evaluate(args):
+    """
+    Evaluate a trained graph contrastive learning model.
 
-    for run in range(num_runs):
-        wandb.log({'run': run})
-        model.reset_parameters()
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
-        criterion = Supervised_NTXentLoss(temperature=args.temperature)
+    Args:
+        args: Command line arguments
+    """
+    # Load pretrained model
+    model = None
+    if args.model == "gin":
+        model = GINModule.load_from_checkpoint(args.checkpoint_path)
+    elif args.model == "resgcn":
+        model = ResGCN.load_from_checkpoint(args.checkpoint_path)
+    else:
+        raise ValueError(f"Unknown model: {args.model}")
 
-        # Pre-training
-        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-        for epoch in range(100):
-            loss = train_epoch(model, loader, criterion, optimizer, device, prefix='pretrain')
-            wandb.log({
-                'run': run,
-                'pretrain_epoch': epoch,
-                'pretrain_loss': loss
-            })
+    # Set up data module
+    data_module = get_dataset(
+        dataset_name=args.dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        root=args.data_dir,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        seed=args.seed
+    )
 
-        # Finetune and evaluate
-        skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=run)
-        labels = [data.y.item() for data in dataset]
-        fold_accuracies = []
+    # Prepare data
+    data_module.prepare_data()
+    data_module.setup()
 
-        for fold, (train_idx, test_idx) in enumerate(skf.split(np.zeros(len(dataset)), labels)):
-            train_dataset = dataset[train_idx]
-            test_dataset = dataset[test_idx]
+    # Determine number of classes based on dataset
+    if args.dataset in ["MUTAG", "IMDB-B", "RDT-B"]:
+        num_classes = 2
+    elif args.dataset == "NCI1":
+        num_classes = 2
+    elif args.dataset == "PROTEINS":
+        num_classes = 2
+    elif args.dataset == "DD":
+        num_classes = 2
+    elif args.dataset == "COLLAB":
+        num_classes = 3
+    elif args.dataset == "RDT-M5K":
+        num_classes = 5
+    else:
+        raise ValueError(f"Unknown dataset for classification: {args.dataset}")
 
-            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-            test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
+    # Create linear classifier
+    linear_classifier = GraphLinearClassifier(
+        model=model.encoder,  # Using only the encoder part of the model
+        batch_size_per_device=args.batch_size,
+        feature_dim=2048,  # Same as the encoder output dimension
+        num_classes=num_classes,
+        freeze_model=not args.finetune,
+        lr=args.lr
+    )
 
-            # Finetune
-            for epoch in range(50):
-                loss = train_epoch(model, train_loader, criterion, optimizer, device, prefix='finetune')
-                wandb.log({
-                    'run': run,
-                    'fold': fold,
-                    'finetune_epoch': epoch,
-                    'finetune_loss': loss
-                })
+    # Set up logger
+    logger_name = f"linear-{args.model}-{args.dataset}"
+    if args.finetune:
+        logger_name += "-finetune"
+    else:
+        logger_name += "-frozen"
 
-            # Evaluate
-            embeddings, labels = get_embeddings(model, test_loader, device)
-            pred = embeddings.argmax(axis=1)
-            acc = accuracy_score(labels, pred)
-            fold_accuracies.append(acc)
+    logger = WandbLogger(project="GraphLinearEval", name=logger_name)
 
-            wandb.log({
-                'run': run,
-                'fold': fold,
-                'fold_accuracy': acc
-            })
+    # Set up callbacks
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_top1",
+        dirpath=args.checkpoint_dir,
+        filename=f"linear-{args.model}-{args.dataset}-" + "{epoch:02d}-{val_top1:.4f}",
+        save_top_k=3,
+        mode="max"
+    )
 
-        run_acc = np.mean(fold_accuracies)
-        accuracies.append(run_acc)
-        wandb.log({
-            'run': run,
-            'run_accuracy': run_acc
-        })
+    # Set up trainer
+    trainer = pl.Trainer(
+        max_epochs=args.eval_epochs,
+        devices=args.devices,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        strategy="ddp" if args.devices > 1 else "auto",
+        logger=logger,
+        callbacks=[checkpoint_callback],
+        precision=16 if args.mixed_precision else 32,
+        deterministic=True
+    )
 
-    mean_acc = np.mean(accuracies)
-    std_acc = np.std(accuracies)
-    wandb.log({
-        'final_accuracy': mean_acc,
-        'accuracy_std': std_acc
-    })
+    # Train and test linear classifier
+    trainer.fit(linear_classifier, data_module)
+    results = trainer.test(datamodule=data_module)
 
-    return mean_acc, std_acc
+    return results
 
 
 def main():
-    args = parse_args()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    parser = argparse.ArgumentParser(description="Graph Contrastive Learning")
 
-    # Initialize wandb
-    init_wandb(args)
+    # General settings
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--data_dir", type=str, default="data", help="Data directory")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Checkpoint directory")
+    parser.add_argument("--devices", type=int, default=1, help="Number of GPUs to use")
+    parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision training")
 
-    # Log system info
-    wandb.log({
-        'device': device.type,
-        'dataset': args.dataset,
-        'mode': args.mode
-    })
+    # Dataset settings
+    parser.add_argument("--dataset", type=str, default="MUTAG",
+                        choices=["NCI1", "PROTEINS", "DD", "MUTAG", "COLLAB", "RDT-B", "RDT-M5K", "IMDB-B"],
+                        help="Dataset name")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
+    parser.add_argument("--train_ratio", type=float, default=0.8, help="Training set ratio")
+    parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation set ratio")
 
-    # Load dataset
-    transform = OneHotDegree(max_degree=10)
-    dataset = TUDataset(root='data', name=args.dataset, transform=transform)
+    # Model settings
+    parser.add_argument("--model", type=str, default="gin", choices=["gin", "resgcn"],
+                        help="Model architecture")
+    parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension size")
+    parser.add_argument("--num_layers", type=int, default=3, help="Number of layers")
+    parser.add_argument("--dropout", type=float, default=0.5, help="Dropout rate")
 
-    # Log dataset info
-    wandb.log({
-        'num_graphs': len(dataset),
-        'num_features': dataset[0].x.size(1),
-        'num_classes': len(torch.unique(dataset[0].y))
-    })
+    # Training settings
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=5e-4, help="Weight decay")
+    parser.add_argument("--use_graph_loss", action="store_true", help="Use graph matching loss")
+    parser.add_argument("--adaptive_graph_loss", action="store_true", help="Use adaptive graph matching loss")
 
-    # Initialize models
-    encoder = GIN(num_features=dataset[0].x.size(1),
-                  hidden_dim=args.hidden_dim,
-                  num_layers=args.num_layers)
+    # Graph loss settings
+    parser.add_argument("--similarity_threshold", type=float, default=0.5,
+                        help="Similarity threshold for graph construction")
+    parser.add_argument("--temperature", type=float, default=0.1, help="Temperature for similarity calculation")
+    parser.add_argument("--k_eigvals", type=int, default=10, help="Number of eigenvalues to use")
+    parser.add_argument("--percentile", type=float, default=90,
+                        help="Percentile of similarity values for adaptive threshold")
+    parser.add_argument("--min_edges", type=float, default=10,
+                        help="Minimum percentage of edges for adaptive threshold")
+    parser.add_argument("--max_edges", type=float, default=50,
+                        help="Maximum percentage of edges for adaptive threshold")
 
-    model = SimGRACE(encoder=encoder,
-                     proj_hidden_dim=args.hidden_dim,
-                     eta=args.eta,
-                     sigma=args.sigma).to(device)
+    # Evaluation settings
+    parser.add_argument("--eval", action="store_true", help="Run evaluation")
+    parser.add_argument("--checkpoint_path", type=str, help="Path to model checkpoint")
+    parser.add_argument("--eval_epochs", type=int, default=100, help="Number of evaluation epochs")
+    parser.add_argument("--finetune", action="store_true", help="Fine-tune the model during evaluation")
 
-    # Log model architecture
-    wandb.watch(model)
+    args = parser.parse_args()
 
-    # Perform evaluation based on mode
-    if args.mode == 'unsupervised':
-        mean_acc, std_acc = unsupervised_evaluation(model, dataset, args, device)
-        print(f'Unsupervised Evaluation Results:')
-        print(f'Accuracy: {mean_acc:.4f} ± {std_acc:.4f}')
+    # Create checkpoint directory if it doesn't exist
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    # Set random seed
+    seed_everything(args.seed)
+
+    if args.eval:
+        if not args.checkpoint_path:
+            raise ValueError("Checkpoint path must be provided for evaluation")
+        results = evaluate(args)
+        print("Evaluation results:", results)
     else:
-        mean_acc, std_acc = semi_supervised_evaluation(model, dataset, args, device)
-        print(f'Semi-supervised Evaluation Results (Label Rate: {args.label_rate}):')
-        print(f'Accuracy: {mean_acc:.4f} ± {std_acc:.4f}')
-
-    wandb.finish()
+        model_path = train(args)
+        print(f"Model saved to {model_path}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
