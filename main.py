@@ -200,7 +200,7 @@ def evaluate(args):
         max_epochs=args.eval_epochs,
         devices=args.devices,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        strategy="ddp" if args.devices > 1 else "auto",
+        strategy="ddp_find_unused_parameters_true" if args.devices > 1 else "auto",
         logger=logger,
         callbacks=[checkpoint_callback],
         precision=16 if args.mixed_precision else 32,
