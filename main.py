@@ -6,9 +6,9 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning import seed_everything
 from pytorch_lightning.loggers import WandbLogger
 
-from datasets import get_dataset
-from models import GINModule, ResGCN
-from linear_classifier import GraphLinearClassifier
+from datasets import GraphDataModule, TransferDataModule, SemiSupervisedDataModule
+from models import SpectralGIN, SpectralResGCN
+from eval import SpectralEvaluator
 from graph_loss import SpectralGraphMatchingLoss, AdaptiveSpectralGraphMatchingLoss
 
 
@@ -20,43 +20,85 @@ def train(args):
         args: Command line arguments
     """
     # Set up data module
-    data_module = get_dataset(
-        dataset_name=args.dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        root=args.data_dir,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-        seed=args.seed
-    )
+    if args.mode == "transfer":
+        data_module = TransferDataModule(
+            pretrain_dataset=args.pretrain_dataset,
+            finetune_dataset=args.dataset,
+            root=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            random_state=args.seed
+        )
+        # For transfer learning, use the pretrain dataset
+        num_features = None  # Will be determined in setup
+    elif args.mode == "semi_supervised":
+        data_module = SemiSupervisedDataModule(
+            dataset_name=args.dataset,
+            root=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            label_rate=args.label_rate,
+            random_state=args.seed
+        )
+        num_features = None  # Will be determined in setup
+    else:  # unsupervised
+        data_module = GraphDataModule(
+            dataset_name=args.dataset,
+            root=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            mode="unsupervised",
+            random_state=args.seed
+        )
+        num_features = None  # Will be determined in setup
 
     # Prepare data
     data_module.prepare_data()
     data_module.setup()
 
-    # Get number of input features from dataset
-    num_features = data_module.get_num_features()
+    # Determine the number of input features from the dataset
+    if args.mode == "transfer":
+        # For transfer learning, use the pretrain dataset
+        data_module.pretrain_dm.setup("fit")
+        train_loader = data_module.pretrain_dataloader()
+        batch = next(iter(train_loader))
+        x, edge_index, _ = data_module.pretrain_dm.process_batch_for_model(batch)
+        num_features = x.size(1)
+    else:
+        # For unsupervised or semi-supervised, use the main dataset
+        train_loader = data_module.train_dataloader()
+        batch = next(iter(train_loader))
+        x, edge_index, _ = data_module.process_batch_for_model(batch)
+        num_features = x.size(1)
 
     # Create model
     if args.model == "gin":
-        model = GINModule(
+        model = SpectralGIN(
             num_features=num_features,
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
             dropout=args.dropout,
             lr=args.lr,
             weight_decay=args.weight_decay,
+            eta=args.eta,
+            sigma=args.sigma,
             dataset=args.dataset,
             has_graph_loss=args.use_graph_loss,
             batch_size_per_device=args.batch_size
         )
     elif args.model == "resgcn":
-        model = ResGCN(
-            in_channels=num_features,
+        model = SpectralResGCN(
+            num_features=num_features,
             hidden_channels=args.hidden_dim,
             num_layers=args.num_layers,
             dropout_rate=args.dropout,
-            learning_rate=args.lr
+            learning_rate=args.lr,
+            eta=args.eta,
+            sigma=args.sigma,
+            weight_decay=args.weight_decay,
+            has_graph_loss=args.use_graph_loss,
+            batch_size_per_device=args.batch_size
         )
     else:
         raise ValueError(f"Unknown model: {args.model}")
@@ -64,7 +106,7 @@ def train(args):
     # Add graph loss if requested
     if args.use_graph_loss:
         if args.adaptive_graph_loss:
-            model.graph_loss = AdaptiveSpectralGraphMatchingLoss(
+            graph_loss = AdaptiveSpectralGraphMatchingLoss(
                 percentile=args.percentile,
                 min_edges_percent=args.min_edges,
                 max_edges_percent=args.max_edges,
@@ -73,15 +115,21 @@ def train(args):
                 gather_distributed=(args.devices > 1)
             )
         else:
-            model.graph_loss = SpectralGraphMatchingLoss(
+            graph_loss = SpectralGraphMatchingLoss(
                 similarity_threshold=args.similarity_threshold,
                 temperature=args.temperature,
                 k_eigvals=args.k_eigvals,
                 gather_distributed=(args.devices > 1)
             )
+        model.graph_loss = graph_loss
 
     # Set up logger
-    logger_name = f"{args.model}-{args.dataset}-batch{args.batch_size}"
+    logger_name = f"{args.model}-{args.dataset}-{args.mode}"
+    if args.mode == "transfer":
+        logger_name += f"-from-{args.pretrain_dataset}"
+    elif args.mode == "semi_supervised":
+        logger_name += f"-{args.label_rate * 100}pct"
+    logger_name += f"-batch{args.batch_size}"
     if args.use_graph_loss:
         logger_name += "-GraphLoss"
 
@@ -111,10 +159,14 @@ def train(args):
     )
 
     # Train model
-    trainer.fit(model, data_module)
+    if args.mode == "transfer":
+        data_module.setup("pretrain")
+        trainer.fit(model, data_module.pretrain_dataloader(), data_module.pretrain_val_dataloader())
+    else:
+        trainer.fit(model, data_module)
 
     # Save final model
-    final_path = os.path.join(args.checkpoint_dir, f"{args.model}-{args.dataset}-final.ckpt")
+    final_path = os.path.join(args.checkpoint_dir, f"{args.model}-{args.dataset}-{args.mode}-final.ckpt")
     trainer.save_checkpoint(final_path)
 
     return final_path
@@ -127,95 +179,69 @@ def evaluate(args):
     Args:
         args: Command line arguments
     """
-    # Load pretrained model
-    model = None
-    if args.model == "gin":
-        model = GINModule.load_from_checkpoint(args.checkpoint_path)
-    elif args.model == "resgcn":
-        model = ResGCN.load_from_checkpoint(args.checkpoint_path)
-    else:
-        raise ValueError(f"Unknown model: {args.model}")
-
     # Set up data module
-    data_module = get_dataset(
+    data_module = GraphDataModule(
         dataset_name=args.dataset,
+        root=args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        root=args.data_dir,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-        seed=args.seed
+        pin_memory=True,
+        mode=args.eval_mode,  # "unsupervised" or "semi_supervised"
+        label_rate=args.label_rate,
+        random_state=args.seed
     )
 
     # Prepare data
     data_module.prepare_data()
     data_module.setup()
 
-    # Determine number of classes based on dataset
-    if args.dataset in ["MUTAG", "IMDB-B", "RDT-B"]:
-        num_classes = 2
-    elif args.dataset == "NCI1":
-        num_classes = 2
-    elif args.dataset == "PROTEINS":
-        num_classes = 2
-    elif args.dataset == "DD":
-        num_classes = 2
-    elif args.dataset == "COLLAB":
-        num_classes = 3
-    elif args.dataset == "RDT-M5K":
-        num_classes = 5
+    # Load pretrained model
+    if args.model == "gin":
+        model = SpectralGIN.load_from_checkpoint(args.checkpoint_path)
+    elif args.model == "resgcn":
+        model = SpectralResGCN.load_from_checkpoint(args.checkpoint_path)
     else:
-        raise ValueError(f"Unknown dataset for classification: {args.dataset}")
+        raise ValueError(f"Unknown model: {args.model}")
 
-    # Create linear classifier
-    linear_classifier = GraphLinearClassifier(
-        model=model.encoder,  # Using only the encoder part of the model
-        batch_size_per_device=args.batch_size,
-        feature_dim=2048,  # Same as the encoder output dimension
-        num_classes=num_classes,
-        freeze_model=not args.finetune,
-        lr=args.lr
+    # Create evaluator
+    evaluator = SpectralEvaluator(
+        model=model,
+        dataset=data_module.get_entire_dataset(),
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        eval_mode=args.eval_mode,
+        label_rate=args.label_rate,
+        random_state=args.seed
     )
 
     # Set up logger
-    logger_name = f"linear-{args.model}-{args.dataset}"
-    if args.finetune:
-        logger_name += "-finetune"
-    else:
-        logger_name += "-frozen"
+    logger_name = f"eval-{args.model}-{args.dataset}-{args.eval_mode}"
+    if args.eval_mode == "semi_supervised":
+        logger_name += f"-{args.label_rate * 100}pct"
 
-    logger = WandbLogger(project="GraphLinearEval", name=logger_name)
+    logger = WandbLogger(project="GraphEvaluation", name=logger_name)
 
-    # Set up callbacks
-    checkpoint_callback = ModelCheckpoint(
-        monitor="val_top1",
-        dirpath=args.checkpoint_dir,
-        filename=f"linear-{args.model}-{args.dataset}-" + "{epoch:02d}-{val_top1:.4f}",
-        save_top_k=3,
-        mode="max"
-    )
-
-    # Set up trainer
+    # Set up trainer for evaluation
     trainer = pl.Trainer(
-        max_epochs=args.eval_epochs,
-        devices=args.devices,
+        devices=1,  # Use single device for evaluation
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        strategy="ddp_find_unused_parameters_true" if args.devices > 1 else "auto",
         logger=logger,
-        callbacks=[checkpoint_callback],
-        precision=16 if args.mixed_precision else 32,
         deterministic=True
     )
 
-    # Train and test linear classifier
-    trainer.fit(linear_classifier, data_module)
-    results = trainer.test(datamodule=data_module)
+    # Setup evaluator
+    evaluator.setup()
+
+    # Run evaluation
+    results = evaluator.evaluate()
+
+    logger.log_metrics(results)
 
     return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Graph Contrastive Learning")
+    parser = argparse.ArgumentParser(description="Graph Contrastive Learning with Spectral Perturbation")
 
     # General settings
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -226,12 +252,12 @@ def main():
 
     # Dataset settings
     parser.add_argument("--dataset", type=str, default="MUTAG",
-                        choices=["NCI1", "PROTEINS", "DD", "MUTAG", "COLLAB", "RDT-B", "RDT-M5K", "IMDB-B"],
+                        choices=["NCI1", "PROTEINS", "DD", "MUTAG", "COLLAB", "RDT-B", "RDT-M5K", "IMDB-B",
+                                 "Tox21", "ToxCast", "Sider", "ClinTox", "MUV", "HIV", "BBBP", "Bace",
+                                 "PPI", "ZINC", "PPI-306K", "ZINC-2M"],
                         help="Dataset name")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
-    parser.add_argument("--train_ratio", type=float, default=0.8, help="Training set ratio")
-    parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation set ratio")
 
     # Model settings
     parser.add_argument("--model", type=str, default="gin", choices=["gin", "resgcn"],
@@ -239,8 +265,18 @@ def main():
     parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension size")
     parser.add_argument("--num_layers", type=int, default=3, help="Number of layers")
     parser.add_argument("--dropout", type=float, default=0.5, help="Dropout rate")
+    parser.add_argument("--eta", type=float, default=0.1, help="Perturbation coefficient eta")
+    parser.add_argument("--sigma", type=float, default=0.1, help="Gaussian noise variance sigma")
 
     # Training settings
+    parser.add_argument("--mode", type=str, default="unsupervised",
+                        choices=["unsupervised", "transfer", "semi_supervised"],
+                        help="Training mode")
+    parser.add_argument("--pretrain_dataset", type=str, default=None,
+                        choices=["PPI-306K", "ZINC-2M"],
+                        help="Dataset for pretraining (transfer learning mode)")
+    parser.add_argument("--label_rate", type=float, default=0.1,
+                        help="Portion of labeled data for semi-supervised learning")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=5e-4, help="Weight decay")
@@ -262,8 +298,9 @@ def main():
     # Evaluation settings
     parser.add_argument("--eval", action="store_true", help="Run evaluation")
     parser.add_argument("--checkpoint_path", type=str, help="Path to model checkpoint")
-    parser.add_argument("--eval_epochs", type=int, default=100, help="Number of evaluation epochs")
-    parser.add_argument("--finetune", action="store_true", help="Fine-tune the model during evaluation")
+    parser.add_argument("--eval_mode", type=str, default="unsupervised",
+                        choices=["unsupervised", "semi_supervised"],
+                        help="Evaluation mode")
 
     args = parser.parse_args()
 
@@ -272,6 +309,10 @@ def main():
 
     # Set random seed
     seed_everything(args.seed)
+
+    # Check arguments consistency
+    if args.mode == "transfer" and args.pretrain_dataset is None:
+        raise ValueError("Pretrain dataset must be provided for transfer learning mode")
 
     if args.eval:
         if not args.checkpoint_path:
