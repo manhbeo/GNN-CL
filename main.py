@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+from lightly.loss import NTXentLoss
 from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
@@ -49,6 +50,8 @@ class SpecMatchCLTrainer(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
+        self.task = task
+
         self.model = build_model(
             task=task,
             projection_dim=projection_dim,
@@ -60,7 +63,17 @@ class SpecMatchCLTrainer(pl.LightningModule):
 
         self.lr = lr
         self.weight_decay = weight_decay
-        self.ntxent = Supervised_NTXentLoss(temperature=temperature)
+
+        if task == "semi_supervised":
+            self.contrastive_loss = Supervised_NTXentLoss(
+                temperature=temperature
+            )
+        else:
+            # unsupervised and transfer pretraining both use standard NTXent
+            self.contrastive_loss = NTXentLoss(
+                temperature=temperature,
+                gather_distributed=True
+            )
 
         self.use_specmatch = use_specmatch
         self.specmatch_weight = specmatch_weight
@@ -91,15 +104,20 @@ class SpecMatchCLTrainer(pl.LightningModule):
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         view1, view2 = batch
-        x1, ei1, b1, _, ea1 = self._unpack_view(view1)
-        x2, ei2, b2, _, ea2 = self._unpack_view(view2)
+        x1, ei1, b1, y1, ea1 = self._unpack_view(view1)
+        x2, ei2, b2, y2, ea2 = self._unpack_view(view2)
 
         h1, z1 = self.forward_once(x1, ei1, b1, ea1)
         h2, z2 = self.forward_once(x2, ei2, b2, ea2)
 
-        loss_cl = self.ntxent(z1, z2)
-        loss = loss_cl
+        if self.task == "semi_supervised":
+            if y1 is None:
+                raise ValueError("Semi-supervised training requires labels in the batch.")
+            loss_cl = self.contrastive_loss(z1, z2, y1)
+        else:
+            loss_cl = self.contrastive_loss(z1, z2)
 
+        loss = loss_cl
         self.log("train/loss_cl", loss_cl, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
 
         if self.use_specmatch:
@@ -195,6 +213,8 @@ def build_lightning_module(args) -> SpecMatchCLTrainer:
     else:
         raise ValueError(f"Unsupported mode: {args.mode}")
 
+    gather_distributed_supcon = args.devices > 1
+
     return SpecMatchCLTrainer(
         task=task,
         projection_dim=args.projection_dim,
@@ -212,6 +232,7 @@ def build_lightning_module(args) -> SpecMatchCLTrainer:
         percentile=args.percentile,
         min_edges_percent=args.min_edges_percent,
         max_edges_percent=args.max_edges_percent,
+        gather_distributed_supcon=gather_distributed_supcon,
     )
 
 
@@ -408,7 +429,7 @@ def parse_args():
     parser.add_argument("--max_edges_percent", type=float, default=50.0)
 
     parser.add_argument("--eval_after_train", action="store_true")
-    parser.add_argument("--checkpoint_path", type=str, default="checkpoints/last.ckpt")
+    parser.add_argument("--checkpoint_path", type=str, default=None)
 
     return parser.parse_args()
 
@@ -425,7 +446,7 @@ def main():
     else:
         checkpoint_path = train(args)
 
-    if args.eval_after_train:
+    if args.eval_after_train or args.checkpoint_path is not None:
         evaluate(args, checkpoint_path)
 
 

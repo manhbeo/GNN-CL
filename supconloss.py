@@ -5,16 +5,15 @@ from lightly.utils import dist
 
 
 class Supervised_NTXentLoss(nn.Module):
-    def __init__(self, temperature: float = 0.1, gather_distributed: bool = False):
+    def __init__(self, temperature: float = 0.1):
         super().__init__()
         self.temperature = temperature
-        self.gather_distributed = gather_distributed
 
     def forward(self, out0: torch.Tensor, out1: torch.Tensor, labels: torch.Tensor):
         out0 = F.normalize(out0, dim=1)
         out1 = F.normalize(out1, dim=1)
 
-        use_distributed = self.gather_distributed and dist.world_size() > 1
+        use_distributed = dist.world_size() > 1
 
         if use_distributed:
             out0_large = torch.cat(dist.gather(out0), dim=0)
