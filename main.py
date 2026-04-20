@@ -1,327 +1,431 @@
 import argparse
 import os
-import torch
+from typing import Any, Dict, Optional, Tuple
+
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+import torch
+import torch.nn as nn
 from pytorch_lightning import seed_everything
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
-from datasets import GraphDataModule, TransferDataModule, SemiSupervisedDataModule
-from models import SpectralGIN, SpectralResGCN
-from eval import SpectralEvaluator
-from graph_loss import SpectralGraphMatchingLoss, AdaptiveSpectralGraphMatchingLoss
+from supconloss import Supervised_NTXentLoss
+from data_module import GraphDataModule, SemiSupervisedDataModule, TransferDataModule
+from eval import GraphLevelEvaluator
+from graph_loss import SpectralGraphMatchingLoss
+from models import build_model
 
 
-def train(args):
+class SpecMatchCLTrainer(pl.LightningModule):
     """
-    Train a graph contrastive learning model.
+    Lightning wrapper for SpecMatchCL.
 
-    Args:
-        args: Command line arguments
+    Train batch format from data_module.py:
+        ((x1, ei1, b1, y1, ea1), (x2, ei2, b2, y2, ea2))
+
+    Validation/test batch format:
+        (x, ei, b, y, ea)
     """
-    # Set up data module
-    if args.mode == "transfer":
-        data_module = TransferDataModule(
-            pretrain_dataset=args.pretrain_dataset,
-            finetune_dataset=args.dataset,
-            root=args.data_dir,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            random_state=args.seed
+
+    def __init__(
+        self,
+        task: str,
+        projection_dim: int = 128,
+        dropout: float = 0.0,
+        pooling: Optional[str] = None,
+        chemistry_mode: bool = False,
+        use_edge_attr: bool = True,
+        lr: float = 1e-3,
+        weight_decay: float = 1e-5,
+        temperature: float = 0.2,
+        use_specmatch: bool = False,
+        specmatch_weight: float = 1.0,
+        similarity_threshold: float = 0.5,
+        adaptive_threshold: bool = False,
+        percentile: float = 90.0,
+        min_edges_percent: float = 10.0,
+        max_edges_percent: float = 50.0,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.model = build_model(
+            task=task,
+            projection_dim=projection_dim,
+            dropout=dropout,
+            pooling=pooling,
+            chemistry_mode=chemistry_mode,
+            use_edge_attr=use_edge_attr,
         )
-        # For transfer learning, use the pretrain dataset
-        num_features = None  # Will be determined in setup
-    elif args.mode == "semi_supervised":
-        data_module = SemiSupervisedDataModule(
-            dataset_name=args.dataset,
-            root=args.data_dir,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            label_rate=args.label_rate,
-            random_state=args.seed
+
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.ntxent = Supervised_NTXentLoss(temperature=temperature)
+
+        self.use_specmatch = use_specmatch
+        self.specmatch_weight = specmatch_weight
+        self.specmatch = None
+        if use_specmatch:
+            self.specmatch = SpectralGraphMatchingLoss(
+                use_adaptive_threshold=adaptive_threshold,
+                similarity_threshold=similarity_threshold,
+                temperature=temperature,
+                percentile=percentile,
+                min_edges_percent=min_edges_percent,
+                max_edges_percent=max_edges_percent,
+            )
+
+    def forward_once(
+        self,
+        x: Optional[torch.Tensor],
+        edge_index: torch.Tensor,
+        batch_index: Optional[torch.Tensor],
+        edge_attr: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.model.forward_once(x, edge_index, batch_index, edge_attr)
+
+    @staticmethod
+    def _unpack_view(view: Tuple[torch.Tensor, ...]):
+        x, edge_index, batch_index, y, edge_attr = view
+        return x, edge_index, batch_index, y, edge_attr
+
+    def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        view1, view2 = batch
+        x1, ei1, b1, _, ea1 = self._unpack_view(view1)
+        x2, ei2, b2, _, ea2 = self._unpack_view(view2)
+
+        h1, z1 = self.forward_once(x1, ei1, b1, ea1)
+        h2, z2 = self.forward_once(x2, ei2, b2, ea2)
+
+        loss_cl = self.ntxent(z1, z2)
+        loss = loss_cl
+
+        self.log("train/loss_cl", loss_cl, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+
+        if self.use_specmatch:
+            loss_spec = self.specmatch(h1, h2)
+            loss = loss + self.specmatch_weight * loss_spec
+            self.log("train/loss_specmatch", loss_spec, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+
+        self.log("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        return loss
+
+    def validation_step(self, batch: Any, batch_idx: int):
+        x, edge_index, batch_index, _, edge_attr = batch
+        h, z = self.forward_once(x, edge_index, batch_index, edge_attr)
+
+        self.log("val/h_norm", h.norm(dim=-1).mean(), on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/z_norm", z.norm(dim=-1).mean(), on_step=False, on_epoch=True, sync_dist=True)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
         )
-        num_features = None  # Will be determined in setup
-    else:  # unsupervised
-        data_module = GraphDataModule(
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.trainer.max_epochs,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+            },
+        }
+
+
+def build_data_module(args):
+    if args.mode == "unsupervised":
+        return GraphDataModule(
             dataset_name=args.dataset,
             root=args.data_dir,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             pin_memory=True,
             mode="unsupervised",
-            random_state=args.seed
+            random_state=args.seed,
         )
-        num_features = None  # Will be determined in setup
 
-    # Prepare data
-    data_module.prepare_data()
-    data_module.setup()
+    if args.mode == "semi_supervised":
+        return SemiSupervisedDataModule(
+            dataset_name=args.dataset,
+            root=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            label_rate=args.label_rate,
+            random_state=args.seed,
+        )
 
-    # Determine the number of input features from the dataset
     if args.mode == "transfer":
-        # For transfer learning, use the pretrain dataset
-        data_module.pretrain_dm.setup("fit")
-        train_loader = data_module.pretrain_dataloader()
-        batch = next(iter(train_loader))
-        x, edge_index, _ = data_module.pretrain_dm.process_batch_for_model(batch)
-        num_features = x.size(1)
-    else:
-        # For unsupervised or semi-supervised, use the main dataset
-        train_loader = data_module.train_dataloader()
-        batch = next(iter(train_loader))
-        x, edge_index, _ = data_module.process_batch_for_model(batch)
-        num_features = x.size(1)
-
-    # Create model
-    if args.model == "gin":
-        model = SpectralGIN(
-            num_features=num_features,
-            hidden_dim=args.hidden_dim,
-            num_layers=args.num_layers,
-            dropout=args.dropout,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            eta=args.eta,
-            sigma=args.sigma,
-            dataset=args.dataset,
-            has_graph_loss=args.use_graph_loss,
-            batch_size_per_device=args.batch_size
+        return TransferDataModule(
+            pretrain_dataset="zinc-2m",
+            finetune_dataset=args.dataset,
+            root=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            random_state=args.seed,
         )
-    elif args.model == "resgcn":
-        model = SpectralResGCN(
-            num_features=num_features,
-            hidden_channels=args.hidden_dim,
-            num_layers=args.num_layers,
-            dropout_rate=args.dropout,
-            learning_rate=args.lr,
-            eta=args.eta,
-            sigma=args.sigma,
-            weight_decay=args.weight_decay,
-            has_graph_loss=args.use_graph_loss,
-            batch_size_per_device=args.batch_size
-        )
-    else:
-        raise ValueError(f"Unknown model: {args.model}")
 
-    # Add graph loss if requested
-    if args.use_graph_loss:
-        if args.adaptive_graph_loss:
-            graph_loss = AdaptiveSpectralGraphMatchingLoss(
-                percentile=args.percentile,
-                min_edges_percent=args.min_edges,
-                max_edges_percent=args.max_edges,
-                temperature=args.temperature,
-                k_eigvals=args.k_eigvals,
-                gather_distributed=(args.devices > 1)
-            )
-        else:
-            graph_loss = SpectralGraphMatchingLoss(
-                similarity_threshold=args.similarity_threshold,
-                temperature=args.temperature,
-                k_eigvals=args.k_eigvals,
-                gather_distributed=(args.devices > 1)
-            )
-        model.graph_loss = graph_loss
+    raise ValueError(f"Unsupported mode: {args.mode}")
 
-    # Set up logger
-    logger_name = f"{args.model}-{args.dataset}-{args.mode}"
-    if args.mode == "transfer":
-        logger_name += f"-from-{args.pretrain_dataset}"
+
+def build_lightning_module(args) -> SpecMatchCLTrainer:
+    if args.mode == "unsupervised":
+        task = "unsupervised"
+        chemistry_mode = False
+        use_edge_attr = False
+        pooling = "add"
+
     elif args.mode == "semi_supervised":
-        logger_name += f"-{args.label_rate * 100}pct"
-    logger_name += f"-batch{args.batch_size}"
-    if args.use_graph_loss:
-        logger_name += "-GraphLoss"
+        task = "semi_supervised"
+        chemistry_mode = False
+        use_edge_attr = False
+        pooling = "add"
 
-    logger = WandbLogger(project="GraphContrastive", name=logger_name)
+    elif args.mode == "transfer":
+        task = "transfer"
+        chemistry_mode = True
+        use_edge_attr = True
+        pooling = "mean"
 
-    # Set up callbacks
-    checkpoint_callback = ModelCheckpoint(
-        monitor="val_loss",
-        dirpath=args.checkpoint_dir,
-        filename=f"{args.model}-{args.dataset}-" + "{epoch:02d}-{val_loss:.4f}",
-        save_top_k=3,
-        mode="min"
+    else:
+        raise ValueError(f"Unsupported mode: {args.mode}")
+
+    return SpecMatchCLTrainer(
+        task=task,
+        projection_dim=args.projection_dim,
+        dropout=args.dropout,
+        pooling=pooling,
+        chemistry_mode=chemistry_mode,
+        use_edge_attr=use_edge_attr,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        temperature=args.temperature,
+        use_specmatch=args.use_specmatch,
+        specmatch_weight=args.specmatch_weight,
+        similarity_threshold=args.similarity_threshold,
+        adaptive_threshold=args.adaptive_threshold,
+        percentile=args.percentile,
+        min_edges_percent=args.min_edges_percent,
+        max_edges_percent=args.max_edges_percent,
     )
 
-    lr_monitor = LearningRateMonitor(logging_interval="step")
 
-    # Set up trainer
-    trainer = pl.Trainer(
+def build_logger(args) -> WandbLogger:
+    name_parts = ["SpecMatchCL", args.mode, args.dataset]
+    if args.mode == "semi_supervised":
+        name_parts.append(f"label{args.label_rate}")
+    if args.use_specmatch:
+        name_parts.append("with-specmatch")
+    else:
+        name_parts.append("no-specmatch")
+
+    run_name = "-".join(name_parts)
+
+    return WandbLogger(
+        project=args.wandb_project,
+        name=run_name,
+        save_dir=args.wandb_dir,
+        log_model=False,
+    )
+
+
+def build_trainer(args, logger) -> pl.Trainer:
+    accelerator = "gpu" if torch.cuda.is_available() and args.devices > 0 else "cpu"
+    devices = args.devices if accelerator == "gpu" else 1
+    strategy = "ddp" if accelerator == "gpu" and devices > 1 else "auto"
+
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=args.checkpoint_dir,
+        filename="{epoch:03d}-{train_loss:.4f}",
+        monitor="train/loss",
+        mode="min",
+        save_top_k=1,
+        save_last=True,
+    )
+
+    lr_monitor = LearningRateMonitor(logging_interval="epoch")
+
+    return pl.Trainer(
         max_epochs=args.epochs,
-        devices=args.devices,
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        strategy="ddp" if args.devices > 1 else "auto",
+        accelerator=accelerator,
+        devices=devices,
+        strategy=strategy,
         logger=logger,
         callbacks=[checkpoint_callback, lr_monitor],
-        precision=16 if args.mixed_precision else 32,
-        deterministic=True
+        precision=32,
+        deterministic=True,
+        log_every_n_steps=50,
     )
 
-    # Train model
+
+def train(args) -> str:
+    seed_everything(args.seed, workers=True)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    data_module = build_data_module(args)
+    model = build_lightning_module(args)
+    logger = build_logger(args)
+    trainer = build_trainer(args, logger)
+
     if args.mode == "transfer":
-        data_module.setup("pretrain")
-        trainer.fit(model, data_module.pretrain_dataloader(), data_module.pretrain_val_dataloader())
+        data_module.prepare_data()
+        data_module.setup("fit")
+        trainer.fit(
+            model,
+            train_dataloaders=data_module.pretrain_dataloader(),
+            val_dataloaders=data_module.pretrain_val_dataloader(),
+        )
     else:
-        trainer.fit(model, data_module)
+        trainer.fit(model, datamodule=data_module)
 
-    # Save final model
-    final_path = os.path.join(args.checkpoint_dir, f"{args.model}-{args.dataset}-{args.mode}-final.ckpt")
-    trainer.save_checkpoint(final_path)
+    ckpt_path = trainer.checkpoint_callback.best_model_path
+    if not ckpt_path:
+        ckpt_path = os.path.join(args.checkpoint_dir, "last.ckpt")
+        trainer.save_checkpoint(ckpt_path)
 
-    return final_path
+    print(f"Best checkpoint: {ckpt_path}")
+    return ckpt_path
 
 
-def evaluate(args):
-    """
-    Evaluate a trained graph contrastive learning model.
-
-    Args:
-        args: Command line arguments
-    """
-    # Set up data module
-    data_module = GraphDataModule(
-        dataset_name=args.dataset,
-        root=args.data_dir,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        mode=args.eval_mode,  # "unsupervised" or "semi_supervised"
-        label_rate=args.label_rate,
-        random_state=args.seed
-    )
-
-    # Prepare data
-    data_module.prepare_data()
-    data_module.setup()
-
-    # Load pretrained model
-    if args.model == "gin":
-        model = SpectralGIN.load_from_checkpoint(args.checkpoint_path)
-    elif args.model == "resgcn":
-        model = SpectralResGCN.load_from_checkpoint(args.checkpoint_path)
-    else:
-        raise ValueError(f"Unknown model: {args.model}")
-
-    # Create evaluator
-    evaluator = SpectralEvaluator(
+def run_unsupervised_evaluation(model: nn.Module, data_module) -> Dict[str, object]:
+    evaluator = GraphLevelEvaluator(
         model=model,
-        dataset=data_module.get_entire_dataset(),
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        eval_mode=args.eval_mode,
-        label_rate=args.label_rate,
-        random_state=args.seed
+        data_module=data_module,
+        mode="unsupervised",
     )
+    return evaluator.evaluate()
 
-    # Set up logger
-    logger_name = f"eval-{args.model}-{args.dataset}-{args.eval_mode}"
-    if args.eval_mode == "semi_supervised":
-        logger_name += f"-{args.label_rate * 100}pct"
 
-    logger = WandbLogger(project="GraphEvaluation", name=logger_name)
-
-    # Set up trainer for evaluation
-    trainer = pl.Trainer(
-        devices=1,  # Use single device for evaluation
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        logger=logger,
-        deterministic=True
+def run_semi_supervised_evaluation(
+    model: nn.Module,
+    data_module,
+    label_rate: float = 0.1,
+    freeze_backbone: bool = False,
+) -> Dict[str, object]:
+    evaluator = GraphLevelEvaluator(
+        model=model,
+        data_module=data_module,
+        mode="semi_supervised",
+        label_rate=label_rate,
     )
+    return evaluator.evaluate(freeze_backbone=freeze_backbone)
 
-    # Setup evaluator
-    evaluator.setup()
 
-    # Run evaluation
-    results = evaluator.evaluate()
+def run_transfer_evaluation(
+    model: nn.Module,
+    data_module,
+    label_rate: float = 0.1,
+    freeze_backbone: bool = False,
+) -> Dict[str, object]:
+    evaluator = GraphLevelEvaluator(
+        model=model,
+        data_module=data_module,
+        mode="transfer",
+        label_rate=label_rate,
+    )
+    return evaluator.evaluate(freeze_backbone=freeze_backbone)
 
-    logger.log_metrics(results)
 
+def evaluate(args, checkpoint_path: str):
+    seed_everything(args.seed, workers=True)
+
+    data_module = build_data_module(args)
+    model = build_lightning_module(args)
+
+    state = torch.load(checkpoint_path, map_location="cpu")
+    model.load_state_dict(state["state_dict"], strict=True)
+
+    if args.mode == "unsupervised":
+        results = run_unsupervised_evaluation(model.model, data_module)
+
+    elif args.mode == "semi_supervised":
+        results = run_semi_supervised_evaluation(
+            model.model,
+            data_module,
+            label_rate=args.label_rate,
+            freeze_backbone=False,
+        )
+
+    elif args.mode == "transfer":
+        results = run_transfer_evaluation(
+            model.model,
+            data_module.finetune_dm,
+            label_rate=args.label_rate,
+            freeze_backbone=False,
+        )
+
+    else:
+        raise ValueError(f"Unsupported mode: {args.mode}")
+
+    print("Evaluation results:")
+    for k, v in results.items():
+        print(f"{k}: {v}")
     return results
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="SpecMatchCL")
+
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--data_dir", type=str, default=".")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    parser.add_argument("--devices", type=int, default=1)
+
+    parser.add_argument("--wandb_project", type=str, default="SpecMatchCL")
+    parser.add_argument("--wandb_dir", type=str, default="wandb_logs")
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="unsupervised",
+        choices=["unsupervised", "semi_supervised", "transfer"],
+    )
+    parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument("--label_rate", type=float, default=0.1)
+
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--num_workers", type=int, default=4)
+
+    parser.add_argument("--projection_dim", type=int, default=64)
+    parser.add_argument("--dropout", type=float, default=0.0)
+
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--temperature", type=float, default=0.2)
+
+    parser.add_argument("--use_specmatch", action="store_true")
+    parser.add_argument("--specmatch_weight", type=float, default=1.0)
+    parser.add_argument("--similarity_threshold", type=float, default=0.5)
+    parser.add_argument("--adaptive_threshold", action="store_true")
+    parser.add_argument("--percentile", type=float, default=90.0)
+    parser.add_argument("--min_edges_percent", type=float, default=10.0)
+    parser.add_argument("--max_edges_percent", type=float, default=50.0)
+
+    parser.add_argument("--eval_after_train", action="store_false")
+    parser.add_argument("--checkpoint_path", type=str, default="checkpoints/last.ckpt")
+
+    return parser.parse_args()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Graph Contrastive Learning with Spectral Perturbation")
+    args = parse_args()
 
-    # General settings
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--data_dir", type=str, default="data", help="Data directory")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Checkpoint directory")
-    parser.add_argument("--devices", type=int, default=1, help="Number of GPUs to use")
-    parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision training")
+    if args.mode == "transfer":
+        if args.dataset not in {"tox21", "toxcast", "sider", "clintox", "muv", "hiv", "bbbp", "bace"}:
+            raise ValueError("Transfer downstream dataset must be one of the MoleculeNet graph-level datasets.")
 
-    # Dataset settings
-    parser.add_argument("--dataset", type=str, default="MUTAG",
-                        choices=["NCI1", "PROTEINS", "DD", "MUTAG", "COLLAB", "RDT-B", "RDT-M5K", "IMDB-B",
-                                 "Tox21", "ToxCast", "Sider", "ClinTox", "MUV", "HIV", "BBBP", "Bace",
-                                 "PPI", "ZINC", "PPI-306K", "ZINC-2M"],
-                        help="Dataset name")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
+    checkpoint_path = args.checkpoint_path
+    if checkpoint_path is None:
+        checkpoint_path = train(args)
 
-    # Model settings
-    parser.add_argument("--model", type=str, default="gin", choices=["gin", "resgcn"],
-                        help="Model architecture")
-    parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension size")
-    parser.add_argument("--num_layers", type=int, default=3, help="Number of layers")
-    parser.add_argument("--dropout", type=float, default=0.5, help="Dropout rate")
-    parser.add_argument("--eta", type=float, default=0.1, help="Perturbation coefficient eta")
-    parser.add_argument("--sigma", type=float, default=0.1, help="Gaussian noise variance sigma")
-
-    # Training settings
-    parser.add_argument("--mode", type=str, default="unsupervised",
-                        choices=["unsupervised", "transfer", "semi_supervised"],
-                        help="Training mode")
-    parser.add_argument("--pretrain_dataset", type=str, default=None,
-                        choices=["PPI-306K", "ZINC-2M"],
-                        help="Dataset for pretraining (transfer learning mode)")
-    parser.add_argument("--label_rate", type=float, default=0.1,
-                        help="Portion of labeled data for semi-supervised learning")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=5e-4, help="Weight decay")
-    parser.add_argument("--use_graph_loss", action="store_true", help="Use graph matching loss")
-    parser.add_argument("--adaptive_graph_loss", action="store_true", help="Use adaptive graph matching loss")
-
-    # Graph loss settings
-    parser.add_argument("--similarity_threshold", type=float, default=0.5,
-                        help="Similarity threshold for graph construction")
-    parser.add_argument("--temperature", type=float, default=0.1, help="Temperature for similarity calculation")
-    parser.add_argument("--k_eigvals", type=int, default=10, help="Number of eigenvalues to use")
-    parser.add_argument("--percentile", type=float, default=90,
-                        help="Percentile of similarity values for adaptive threshold")
-    parser.add_argument("--min_edges", type=float, default=10,
-                        help="Minimum percentage of edges for adaptive threshold")
-    parser.add_argument("--max_edges", type=float, default=50,
-                        help="Maximum percentage of edges for adaptive threshold")
-
-    # Evaluation settings
-    parser.add_argument("--eval", action="store_true", help="Run evaluation")
-    parser.add_argument("--checkpoint_path", type=str, help="Path to model checkpoint")
-    parser.add_argument("--eval_mode", type=str, default="unsupervised",
-                        choices=["unsupervised", "semi_supervised"],
-                        help="Evaluation mode")
-
-    args = parser.parse_args()
-
-    # Create checkpoint directory if it doesn't exist
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-
-    # Set random seed
-    seed_everything(args.seed)
-
-    # Check arguments consistency
-    if args.mode == "transfer" and args.pretrain_dataset is None:
-        raise ValueError("Pretrain dataset must be provided for transfer learning mode")
-
-    if args.eval:
-        if not args.checkpoint_path:
-            raise ValueError("Checkpoint path must be provided for evaluation")
-        results = evaluate(args)
-        print("Evaluation results:", results)
-    else:
-        model_path = train(args)
-        print(f"Model saved to {model_path}")
+    if args.eval_after_train or args.checkpoint_path is not None:
+        evaluate(args, checkpoint_path)
 
 
 if __name__ == "__main__":

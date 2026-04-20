@@ -7,6 +7,7 @@ class BatchMasking(Data):
     base class, all its methods can also be used here.
     In addition, single graphs can be reconstructed via the assignment vector
     :obj:`batch`, which maps each node to its respective graph identifier.
+    Adapt from the repo https://github.com/snap-stanford/pretrain-gnns
     """
 
     def __init__(self, batch=None, **kwargs):

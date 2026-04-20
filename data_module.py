@@ -1,276 +1,425 @@
 import os
+from typing import Callable, Optional, Tuple, Any
+
 import torch
-import numpy as np
 import pytorch_lightning as pl
-from torch_geometric.datasets import TUDataset, PPI, ZINC, MoleculeNet
+from torch.utils.data import Dataset, Subset
+from torch_geometric.datasets import TUDataset, ZINC, MoleculeNet
 from torch_geometric.loader import DataLoader
-from torch.utils.data import random_split
+from torch_geometric.data import Batch, Data
+
 from chem_loader import MoleculeDataset
-from bio_loader import BioDataset
-from bio_batch import BatchMasking as BioBatchMasking
 from chem_batch import BatchMasking as ChemBatchMasking
-from torch_geometric.data import Batch
+
+
+def identity_augment(data: Data) -> Data:
+    return data.clone()
+
+
+class ContrastiveDataset(Dataset):
+    """
+    Wrap a graph dataset and return two augmented views of the same graph.
+    """
+
+    def __init__(
+        self,
+        base_dataset,
+        aug1: Optional[Callable[[Data], Data]] = None,
+        aug2: Optional[Callable[[Data], Data]] = None,
+    ):
+        self.base_dataset = base_dataset
+        self.aug1 = aug1 if aug1 is not None else identity_augment
+        self.aug2 = aug2 if aug2 is not None else identity_augment
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        data = self.base_dataset[idx]
+        view1 = self.aug1(data.clone())
+        view2 = self.aug2(data.clone())
+        return view1, view2
 
 
 class GraphDataModule(pl.LightningDataModule):
+    TU_UNSUPERVISED = {
+        "nci1", "proteins", "dd", "mutag", "collab", "rdt-b", "rdt-m5k", "imdb-b"
+    }
+
+    TU_SEMISUPERVISED = {
+        "nci1", "proteins", "dd", "collab", "rdt-b", "rdt-m5k"
+    }
+
+    MOLECULENET_DOWNSTREAM = {
+        "tox21", "toxcast", "sider", "clintox", "muv", "hiv", "bbbp", "bace"
+    }
+
+    TU_NAME_MAP = {
+        "nci1": "NCI1",
+        "proteins": "PROTEINS",
+        "dd": "DD",
+        "mutag": "MUTAG",
+        "collab": "COLLAB",
+        "rdt-b": "REDDIT-BINARY",
+        "rdt-m5k": "REDDIT-MULTI-5K",
+        "imdb-b": "IMDB-BINARY",
+    }
+
+    MOLECULENET_NAME_MAP = {
+        "tox21": "Tox21",
+        "toxcast": "ToxCast",
+        "sider": "SIDER",
+        "clintox": "ClinTox",
+        "muv": "MUV",
+        "hiv": "HIV",
+        "bbbp": "BBBP",
+        "bace": "BACE",
+    }
+
     def __init__(
-            self,
-            dataset_name,
-            root="data",
-            batch_size=32,
-            num_workers=4,
-            pin_memory=True,
-            mode="unsupervised",  # "unsupervised", "transfer", "semi_supervised"
-            pretrain_dataset=None,  # For transfer learning: "PPI-306K" or "ZINC-2M"
-            label_rate=0.1,  # For semi-supervised learning: 0.01 for 1%, 0.1 for 10%
-            random_state=42
+        self,
+        dataset_name: str,
+        root: str = ".",
+        batch_size: int = 32,
+        num_workers: int = 4,
+        pin_memory: bool = True,
+        mode: str = "unsupervised",   # "unsupervised", "semi_supervised", "supervised"
+        label_rate: float = 0.1,
+        val_ratio: float = 0.1,
+        test_ratio: float = 0.1,
+        random_state: int = 42,
+        zinc_subset: bool = False,
+        persistent_workers: Optional[bool] = None,
+        drop_last_train: bool = True,
+        train_aug1: Optional[Callable[[Data], Data]] = None,
+        train_aug2: Optional[Callable[[Data], Data]] = None,
     ):
         super().__init__()
-        self.dataset_name = dataset_name
+        self.dataset_name = dataset_name.lower()
         self.root = root
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.mode = mode
-        self.pretrain_dataset = pretrain_dataset
         self.label_rate = label_rate
+        self.val_ratio = val_ratio
+        self.test_ratio = test_ratio
         self.random_state = random_state
+        self.zinc_subset = zinc_subset
+        self.drop_last_train = drop_last_train
+        self.train_aug1 = train_aug1 if train_aug1 is not None else identity_augment
+        self.train_aug2 = train_aug2 if train_aug2 is not None else identity_augment
+        self.persistent_workers = (
+            persistent_workers if persistent_workers is not None else num_workers > 0
+        )
 
-        # Set up specific dataset parameters
-        self.setup_dataset_params()
+        self.dataset = None
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+        self.train_pair_dataset = None
 
-    def setup_dataset_params(self):
-        """Set specific parameters based on dataset name"""
-        # Unsupervised datasets from TU Dataset collection
-        self.tu_datasets = ["NCI1", "PROTEINS", "DD", "MUTAG", "COLLAB", "RDT-B", "RDT-M5K", "IMDB-B"]
+        self.labeled_mask = None
+        self.labeled_train_dataset = None
+        self.unlabeled_train_dataset = None
 
-        # Datasets for finetuning with ZINC-2M pretraining
-        self.molecule_datasets = ["Tox21", "ToxCast", "Sider", "ClinTox", "MUV", "HIV", "BBBP", "Bace"]
+    # ----------------------------
+    # Helpers
+    # ----------------------------
 
-        # Check dataset type
-        self.dataset_type = None
-        if self.dataset_name in self.tu_datasets:
-            self.dataset_type = "tu"
-        elif self.dataset_name in self.molecule_datasets:
-            self.dataset_type = "molecule"
-        elif self.dataset_name == "PPI":
-            self.dataset_type = "ppi"
-        elif self.dataset_name == "ZINC":
-            self.dataset_type = "zinc"
-        elif self.dataset_name == "PPI-306K":
-            self.dataset_type = "ppi_large"
-        elif self.dataset_name == "ZINC-2M":
-            self.dataset_type = "zinc_large"
-        else:
-            raise ValueError(f"Unknown dataset: {self.dataset_name}")
+    def _is_tu(self) -> bool:
+        return self.dataset_name in self.TU_UNSUPERVISED or self.dataset_name in self.TU_SEMISUPERVISED
+
+    def _is_moleculenet(self) -> bool:
+        return self.dataset_name in self.MOLECULENET_DOWNSTREAM
+
+    def _is_snap_chem(self) -> bool:
+        return self.dataset_name == "zinc-2m"
+
+    def _is_regular_zinc(self) -> bool:
+        return self.dataset_name == "zinc"
+
+    def _random_split_dataset(self, dataset) -> Tuple[Subset, Optional[Subset], Optional[Subset]]:
+        n = len(dataset)
+        n_val = int(n * self.val_ratio)
+        n_test = int(n * self.test_ratio)
+        n_train = n - n_val - n_test
+
+        if n_train <= 0:
+            raise ValueError(
+                f"Invalid split sizes for dataset length {n}: "
+                f"train={n_train}, val={n_val}, test={n_test}"
+            )
+
+        generator = torch.Generator().manual_seed(self.random_state)
+        train_ds, val_ds, test_ds = torch.utils.data.random_split(
+            dataset, [n_train, n_val, n_test], generator=generator
+        )
+        return train_ds, val_ds, test_ds
+
+    def _batch_graphs(self, batch_list):
+        if len(batch_list) == 0:
+            return batch_list
+
+        if self._is_snap_chem():
+            return ChemBatchMasking.from_data_list(batch_list)
+
+        return Batch.from_data_list(batch_list)
+
+    def _collate_pair(self, batch):
+        view1_list = [x[0] for x in batch]
+        view2_list = [x[1] for x in batch]
+        return self._batch_graphs(view1_list), self._batch_graphs(view2_list)
+
+    def _collate_single(self, batch):
+        return self._batch_graphs(batch)
+
+    # ----------------------------
+    # Dataset loading
+    # ----------------------------
 
     def prepare_data(self):
-        """Download datasets if not available"""
-        # This method is called only once and on a single process
-        if self.dataset_type == "tu":
-            # TU datasets
-            TUDataset(root=os.path.join(self.root, self.dataset_name), name=self.dataset_name)
-        elif self.dataset_type == "ppi":
-            # PPI dataset
-            PPI(root=os.path.join(self.root, 'PPI'))
-        elif self.dataset_type == "zinc":
-            # ZINC dataset
-            ZINC(root=os.path.join(self.root, 'ZINC'))
-        elif self.dataset_type == "molecule":
-            # MoleculeNet datasets
-            MoleculeNet(root=os.path.join(self.root, self.dataset_name), name=self.dataset_name)
+        if self._is_tu():
+            TUDataset(
+                root=os.path.join(self.root, self.dataset_name),
+                name=self.TU_NAME_MAP[self.dataset_name],
+            )
 
-        # For large datasets, we assume they are already downloaded and preprocessed
+        elif self._is_regular_zinc():
+            ZINC(root=os.path.join(self.root, "zinc"), split="train", subset=self.zinc_subset)
+            ZINC(root=os.path.join(self.root, "zinc"), split="val", subset=self.zinc_subset)
+            ZINC(root=os.path.join(self.root, "zinc"), split="test", subset=self.zinc_subset)
 
-    def setup(self, stage=None):
-        """Load datasets based on stage"""
-        if stage == 'fit' or stage is None:
-            # Load the full dataset
-            self.dataset = self._load_dataset()
+        elif self._is_moleculenet():
+            MoleculeNet(
+                root=os.path.join(self.root, self.dataset_name),
+                name=self.MOLECULENET_NAME_MAP[self.dataset_name],
+            )
 
-            # Check if dataset has explicit train/val/test splits
-            self.has_explicit_split = hasattr(self.dataset, 'train_mask') and hasattr(self.dataset, 'val_mask')
-
-            if self.has_explicit_split:
-                # Use predefined splits
-                train_idx = torch.where(self.dataset.train_mask)[0].tolist()
-                val_idx = torch.where(self.dataset.val_mask)[0].tolist()
-
-                self.train_dataset = [self.dataset[i] for i in train_idx]
-                self.val_dataset = [self.dataset[i] for i in val_idx]
-            else:
-                # Split into train and validation
-                # For semi-supervised, we'll apply label masking to the training set
-                train_size = int(0.8 * len(self.dataset))
-                val_size = len(self.dataset) - train_size
-
-                # Create train/val splits with fixed random seed for reproducibility
-                generator = torch.Generator().manual_seed(self.random_state)
-                self.train_dataset, self.val_dataset = torch.utils.data.random_split(
-                    self.dataset, [train_size, val_size], generator=generator
-                )
-
-            # For semi-supervised learning, apply label masking to training set
-            if self.mode == "semi_supervised":
-                self.apply_semi_supervised_masking()
-
-    def apply_semi_supervised_masking(self):
-        """Create a mask for labeled data in semi-supervised setting"""
-        # Create a mask to track which nodes have labels
-        # We don't actually modify the dataset, as eval.py handles the label rate
-        num_train_samples = len(self.train_dataset)
-        num_labeled = max(1, int(num_train_samples * self.label_rate))
-
-        # Generate random indices for labeled samples
-        np.random.seed(self.random_state)
-        labeled_indices = np.random.choice(num_train_samples, num_labeled, replace=False)
-
-        # Create a boolean mask
-        self.labeled_mask = np.zeros(num_train_samples, dtype=bool)
-        self.labeled_mask[labeled_indices] = True
-
-        print(f"Applied {self.label_rate * 100:.1f}% label rate: {num_labeled}/{num_train_samples} samples labeled")
-
-    def _load_dataset(self):
-        """Load specific dataset based on name and type"""
-        if self.dataset_type == "tu":
-            return TUDataset(root=os.path.join(self.root, self.dataset_name), name=self.dataset_name)
-
-        elif self.dataset_type == "molecule":
-            return MoleculeNet(root=os.path.join(self.root, self.dataset_name), name=self.dataset_name)
-
-        elif self.dataset_type == "ppi":
-            train_dataset = PPI(root=os.path.join(self.root, 'PPI'), split='train')
-            val_dataset = PPI(root=os.path.join(self.root, 'PPI'), split='val')
-            combined_dataset = train_dataset + val_dataset
-            return combined_dataset
-
-        elif self.dataset_type == "zinc":
-            train_dataset = ZINC(root=os.path.join(self.root, 'ZINC'), split='train')
-            val_dataset = ZINC(root=os.path.join(self.root, 'ZINC'), split='val')
-
-            combined_dataset = train_dataset + val_dataset
-            return combined_dataset
-
-        elif self.dataset_type == "ppi_large":
-            # Using the custom BioDataset class
-            return BioDataset(root=os.path.join(self.root, 'PPI-306K'), data_type='unsupervised')
-
-        elif self.dataset_type == "zinc_large":
-            # Using the custom MoleculeDataset class
-            return MoleculeDataset(root=os.path.join(self.root, 'ZINC-2M'), dataset='zinc_standard_agent')
-
-    def _collate_fn(self, batch):
-        """Custom collate function to handle different data formats"""
-        if len(batch) == 0:
-            return batch
-
-        # Check batch type and select appropriate collation
-        if self.dataset_type == "ppi_large":
-            return BioBatchMasking.from_data_list(batch)
-        elif self.dataset_type == "zinc_large":
-            return ChemBatchMasking.from_data_list(batch)
-        else:
-            # Default PyG collation
-            return Batch.from_data_list(batch)
-
-    def process_batch_for_model(self, batch):
-        """Process batch into format expected by model (x, edge_index, labels)"""
-        # Different datasets have different formats, so we need to standardize
-        if self.dataset_type in ["tu", "molecule"]:
-            # TU datasets and MoleculeNet typically have x, edge_index, y
-            x = batch.x
-            edge_index = batch.edge_index
-            if hasattr(batch, 'y'):
-                y = batch.y
-                # Handle different y shapes
-                if y.dim() > 1 and y.size(1) == 1:
-                    y = y.squeeze(1)
-            else:
-                y = torch.zeros(batch.num_nodes, dtype=torch.long)
-
-            return x, edge_index, y
-
-        elif self.dataset_type in ["ppi", "ppi_large"]:
-            # PPI datasets
-            x = batch.x
-            edge_index = batch.edge_index
-            if hasattr(batch, 'y'):
-                y = batch.y
-            else:
-                y = torch.zeros(batch.num_nodes, dtype=torch.long)
-
-            return x, edge_index, y
-
-        elif self.dataset_type in ["zinc", "zinc_large"]:
-            # ZINC datasets
-            x = batch.x
-            edge_index = batch.edge_index
-            if hasattr(batch, 'y'):
-                y = batch.y
-            else:
-                y = torch.zeros(batch.num_nodes, dtype=torch.long)
-
-            return x, edge_index, y
+        elif self._is_snap_chem():
+            MoleculeDataset(
+                root=os.path.join(self.root, "chem", "dataset", "zinc_standard_agent"),
+                dataset="zinc_standard_agent",
+            )
 
         else:
-            # Default handling
-            x = batch.x if hasattr(batch, 'x') else None
-            edge_index = batch.edge_index if hasattr(batch, 'edge_index') else None
-            y = batch.y if hasattr(batch, 'y') else torch.zeros(batch.num_nodes, dtype=torch.long)
+            raise ValueError(f"Unsupported dataset_name for graph-level setting: {self.dataset_name}")
 
-            return x, edge_index, y
+    def setup(self, stage: Optional[str] = None):
+        if stage not in (None, "fit", "validate", "test", "predict"):
+            return
+
+        if self.train_dataset is not None:
+            return
+
+        if self._is_regular_zinc():
+            self.train_dataset = ZINC(
+                root=os.path.join(self.root, "zinc"),
+                split="train",
+                subset=self.zinc_subset,
+            )
+            self.val_dataset = ZINC(
+                root=os.path.join(self.root, "zinc"),
+                split="val",
+                subset=self.zinc_subset,
+            )
+            self.test_dataset = ZINC(
+                root=os.path.join(self.root, "zinc"),
+                split="test",
+                subset=self.zinc_subset,
+            )
+            self.dataset = self.train_dataset
+
+        elif self._is_snap_chem():
+            dataset = MoleculeDataset(
+                root=os.path.join(self.root, "chem", "dataset", "zinc_standard_agent"),
+                dataset="zinc_standard_agent",
+            )
+            self.dataset = dataset
+            self.train_dataset = dataset
+            self.val_dataset = None
+            self.test_dataset = None
+
+        elif self._is_tu():
+            dataset = TUDataset(
+                root=os.path.join(self.root, self.dataset_name),
+                name=self.TU_NAME_MAP[self.dataset_name],
+            )
+            self.dataset = dataset
+
+            if self.mode == "unsupervised":
+                self.train_dataset = dataset
+                self.val_dataset = None
+                self.test_dataset = None
+            else:
+                self.train_dataset, self.val_dataset, self.test_dataset = self._random_split_dataset(dataset)
+
+        elif self._is_moleculenet():
+            dataset = MoleculeNet(
+                root=os.path.join(self.root, self.dataset_name),
+                name=self.MOLECULENET_NAME_MAP[self.dataset_name],
+            )
+            self.dataset = dataset
+            self.train_dataset, self.val_dataset, self.test_dataset = self._random_split_dataset(dataset)
+
+        else:
+            raise ValueError(f"Unsupported dataset_name for graph-level setting: {self.dataset_name}")
+
+        if self.mode == "semi_supervised":
+            self._apply_semi_supervised_split()
+
+        self.train_pair_dataset = ContrastiveDataset(
+            self.train_dataset,
+            aug1=self.train_aug1,
+            aug2=self.train_aug2,
+        )
+
+    def _apply_semi_supervised_split(self):
+        if self.dataset_name not in self.TU_SEMISUPERVISED:
+            raise ValueError(
+                "Semi-supervised mode is only configured here for the TU semi-supervised datasets."
+            )
+
+        num_train = len(self.train_dataset)
+        num_labeled = max(1, int(num_train * self.label_rate))
+
+        generator = torch.Generator().manual_seed(self.random_state)
+        perm = torch.randperm(num_train, generator=generator)
+        labeled_local_indices = perm[:num_labeled].tolist()
+        unlabeled_local_indices = perm[num_labeled:].tolist()
+
+        self.labeled_mask = torch.zeros(num_train, dtype=torch.bool)
+        self.labeled_mask[labeled_local_indices] = True
+
+        if isinstance(self.train_dataset, Subset):
+            base_dataset = self.train_dataset.dataset
+            base_indices = list(self.train_dataset.indices)
+
+            labeled_base_indices = [base_indices[i] for i in labeled_local_indices]
+            unlabeled_base_indices = [base_indices[i] for i in unlabeled_local_indices]
+
+            self.labeled_train_dataset = Subset(base_dataset, labeled_base_indices)
+            self.unlabeled_train_dataset = Subset(base_dataset, unlabeled_base_indices)
+        else:
+            self.labeled_train_dataset = Subset(self.train_dataset, labeled_local_indices)
+            self.unlabeled_train_dataset = Subset(self.train_dataset, unlabeled_local_indices)
+
+        self.train_dataset = self.labeled_train_dataset
+
+    # ----------------------------
+    # Batch formatting
+    # ----------------------------
+
+    def process_batch_for_model(self, batch: Any):
+        """
+        Single-view batch:
+            returns x, edge_index, batch_index, y, edge_attr
+
+        Two-view batch:
+            returns (x1, ei1, b1, y1, ea1), (x2, ei2, b2, y2, ea2)
+        """
+        if isinstance(batch, tuple) and len(batch) == 2:
+            return self.process_batch_for_model(batch[0]), self.process_batch_for_model(batch[1])
+
+        x = batch.x if hasattr(batch, "x") else None
+        edge_index = batch.edge_index if hasattr(batch, "edge_index") else None
+        batch_index = batch.batch if hasattr(batch, "batch") else None
+        edge_attr = batch.edge_attr if hasattr(batch, "edge_attr") else None
+        y = batch.y if hasattr(batch, "y") else None
+
+        if y is not None and y.dim() > 1 and y.size(-1) == 1:
+            y = y.squeeze(-1)
+
+        return x, edge_index, batch_index, y, edge_attr
+
+    # ----------------------------
+    # Dataloaders
+    # ----------------------------
 
     def train_dataloader(self):
-        """Return training dataloader"""
         return DataLoader(
-            self.train_dataset,
+            self.train_pair_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=self._collate_fn
+            persistent_workers=self.persistent_workers,
+            drop_last=self.drop_last_train,
+            collate_fn=self._collate_pair,
         )
 
     def val_dataloader(self):
-        """Return validation dataloader"""
+        if self.val_dataset is None:
+            return None
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=self._collate_fn
+            persistent_workers=self.persistent_workers,
+            collate_fn=self._collate_single,
         )
 
+    def test_dataloader(self):
+        if self.test_dataset is None:
+            return None
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+            collate_fn=self._collate_single,
+        )
+
+    # ----------------------------
+    # Convenience getters
+    # ----------------------------
+
     def get_entire_dataset(self):
-        """Return the entire dataset for evaluation purposes"""
         return self.dataset
+
+    def get_labeled_mask(self):
+        return self.labeled_mask
+
+    def get_unlabeled_train_dataset(self):
+        return self.unlabeled_train_dataset
 
 
 class TransferDataModule(pl.LightningDataModule):
-    """Specialized data module for transfer learning scenarios"""
+    VALID_PRETRAIN = {"zinc-2m"}
+    VALID_DOWNSTREAM = {"tox21", "toxcast", "sider", "clintox", "muv", "hiv", "bbbp", "bace"}
 
     def __init__(
-            self,
-            pretrain_dataset,
-            finetune_dataset,
-            root="data",
-            batch_size=32,
-            num_workers=4,
-            pin_memory=True,
-            random_state=42
+        self,
+        pretrain_dataset: str,
+        finetune_dataset: str,
+        root: str = ".",
+        batch_size: int = 32,
+        num_workers: int = 4,
+        pin_memory: bool = True,
+        random_state: int = 42,
+        zinc_subset: bool = False,
+        pretrain_aug1: Optional[Callable[[Data], Data]] = None,
+        pretrain_aug2: Optional[Callable[[Data], Data]] = None,
+        finetune_aug1: Optional[Callable[[Data], Data]] = None,
+        finetune_aug2: Optional[Callable[[Data], Data]] = None,
     ):
         super().__init__()
-        self.pretrain_dataset_name = pretrain_dataset
-        self.finetune_dataset_name = finetune_dataset
-        self.root = root
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.pin_memory = pin_memory
-        self.random_state = random_state
 
-        # Create individual data modules for pretraining and finetuning
+        pretrain_dataset = pretrain_dataset.lower()
+        finetune_dataset = finetune_dataset.lower()
+
+        if pretrain_dataset not in self.VALID_PRETRAIN:
+            raise ValueError(f"Invalid graph-level pretrain dataset: {pretrain_dataset}")
+
+        if finetune_dataset not in self.VALID_DOWNSTREAM:
+            raise ValueError(
+                f"Invalid graph-level downstream dataset: {finetune_dataset}"
+            )
+
         self.pretrain_dm = GraphDataModule(
             dataset_name=pretrain_dataset,
             root=root,
@@ -278,7 +427,10 @@ class TransferDataModule(pl.LightningDataModule):
             num_workers=num_workers,
             pin_memory=pin_memory,
             mode="unsupervised",
-            random_state=random_state
+            random_state=random_state,
+            zinc_subset=zinc_subset,
+            train_aug1=pretrain_aug1,
+            train_aug2=pretrain_aug2,
         )
 
         self.finetune_dm = GraphDataModule(
@@ -287,57 +439,62 @@ class TransferDataModule(pl.LightningDataModule):
             batch_size=batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            mode="unsupervised",  # We handle fine-tuning evaluation ourselves
-            random_state=random_state
+            mode="supervised",
+            random_state=random_state,
+            zinc_subset=zinc_subset,
+            train_aug1=finetune_aug1,
+            train_aug2=finetune_aug2,
         )
 
     def prepare_data(self):
-        """Download datasets if not available"""
         self.pretrain_dm.prepare_data()
         self.finetune_dm.prepare_data()
 
-    def setup(self, stage=None):
-        """Setup datasets for pretraining or finetuning based on stage"""
-        if stage == 'pretrain' or stage is None:
-            self.pretrain_dm.setup(stage='fit')
-
-        if stage == 'finetune' or stage is None:
-            self.finetune_dm.setup(stage='fit')
+    def setup(self, stage: Optional[str] = None):
+        self.pretrain_dm.setup("fit")
+        self.finetune_dm.setup("fit")
 
     def pretrain_dataloader(self):
-        """Return dataloader for pretraining"""
         return self.pretrain_dm.train_dataloader()
 
     def pretrain_val_dataloader(self):
-        """Return validation dataloader for pretraining"""
         return self.pretrain_dm.val_dataloader()
 
     def finetune_train_dataloader(self):
-        """Return dataloader for finetuning training"""
         return self.finetune_dm.train_dataloader()
 
     def finetune_val_dataloader(self):
-        """Return dataloader for finetuning validation"""
         return self.finetune_dm.val_dataloader()
 
+    def finetune_test_dataloader(self):
+        return self.finetune_dm.test_dataloader()
+
     def get_finetune_dataset(self):
-        """Return the entire finetuning dataset for evaluation purposes"""
         return self.finetune_dm.get_entire_dataset()
 
 
 class SemiSupervisedDataModule(GraphDataModule):
-    """Specialized data module for semi-supervised learning"""
-
     def __init__(
-            self,
-            dataset_name,
-            root="data",
-            batch_size=32,
-            num_workers=4,
-            pin_memory=True,
-            label_rate=0.1,  # 0.01 for 1%, 0.1 for 10%
-            random_state=42
+        self,
+        dataset_name: str,
+        root: str = ".",
+        batch_size: int = 32,
+        num_workers: int = 4,
+        pin_memory: bool = True,
+        label_rate: float = 0.1,
+        val_ratio: float = 0.1,
+        test_ratio: float = 0.1,
+        random_state: int = 42,
+        train_aug1: Optional[Callable[[Data], Data]] = None,
+        train_aug2: Optional[Callable[[Data], Data]] = None,
     ):
+        dataset_name = dataset_name.lower()
+        if dataset_name not in GraphDataModule.TU_SEMISUPERVISED:
+            raise ValueError(
+                f"{dataset_name} is not in the configured TU semi-supervised set: "
+                f"{sorted(GraphDataModule.TU_SEMISUPERVISED)}"
+            )
+
         super().__init__(
             dataset_name=dataset_name,
             root=root,
@@ -346,9 +503,9 @@ class SemiSupervisedDataModule(GraphDataModule):
             pin_memory=pin_memory,
             mode="semi_supervised",
             label_rate=label_rate,
-            random_state=random_state
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            random_state=random_state,
+            train_aug1=train_aug1,
+            train_aug2=train_aug2,
         )
-
-    def get_labeled_mask(self):
-        """Return the mask indicating which training samples are labeled"""
-        return self.labeled_mask

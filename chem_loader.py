@@ -17,6 +17,10 @@ from torch_geometric.data import InMemoryDataset
 from torch_geometric.data import Batch
 from itertools import repeat, product, chain
 
+'''
+Adapt from the repo https://github.com/snap-stanford/pretrain-gnns
+'''
+
 
 # allowable node and edge features
 allowable_features = {

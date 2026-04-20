@@ -1,229 +1,117 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from lightly.utils import dist
+import torch.distributed as dist
+
+# The previous version of the loss had a bug where the graph was built separately on each rank, leading to inconsistent graphs and incorrect loss values.
+class _GatherLayer(torch.autograd.Function):
+    """
+    Gather tensors from all ranks with backward support.
+    """
+    @staticmethod
+    def forward(ctx, x):
+        if not dist.is_initialized():
+            return (x,)
+
+        world_size = dist.get_world_size()
+        outputs = [torch.zeros_like(x) for _ in range(world_size)]
+        dist.all_gather(outputs, x)
+        return tuple(outputs)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        if not dist.is_initialized():
+            return grads[0]
+
+        rank = dist.get_rank()
+        grad_out = grads[rank].contiguous()
+        dist.all_reduce(grad_out, op=dist.ReduceOp.SUM)
+        return grad_out
+
+
+def gather_with_grad(x: torch.Tensor) -> torch.Tensor:
+    if not dist.is_initialized():
+        return x
+    return torch.cat(_GatherLayer.apply(x), dim=0)
+
 
 class SpectralGraphMatchingLoss(nn.Module):
     def __init__(
-            self,
-            similarity_threshold=0.5,
-            temperature=0.1,
-            k_eigvals=10,
-            gather_distributed=False
+        self,
+        use_adaptive_threshold: bool = False,
+        similarity_threshold: float = 0.5,
+        temperature: float = 0.1,
+        percentile: float = 90,
+        min_edges_percent: float = 10,
+        max_edges_percent: float = 50,
     ):
-        """
-        Spectral graph matching loss that compares the structural properties
-        of graphs constructed from two views of the data.
-
-        Parameters:
-        - similarity_threshold (float): Threshold for constructing edges in the similarity graph.
-                                       Values above this threshold create an edge.
-        - temperature (float): Temperature for the similarity calculations.
-        - k_eigvals (int): Number of smallest eigenvalues to use for spectral comparison.
-        - gather_distributed (bool): Whether to gather data across multiple distributed processes.
-        """
-        super(SpectralGraphMatchingLoss, self).__init__()
+        super().__init__()
+        self.use_adaptive_threshold = use_adaptive_threshold
         self.similarity_threshold = similarity_threshold
         self.temperature = temperature
-        self.k_eigvals = k_eigvals
-        self.use_distributed = gather_distributed and dist.world_size() > 1
-
-    def _construct_adjacency_matrix(self, embeddings):
-        """
-        Construct adjacency matrix from embeddings using cosine similarity.
-
-        Parameters:
-        - embeddings (torch.Tensor): Normalized embeddings, shape (batch_size, embedding_dim).
-
-        Returns:
-        - torch.Tensor: Adjacency matrix.
-        """
-        # Compute similarity matrix
-        similarities = torch.matmul(embeddings, embeddings.T) / self.temperature
-
-        # Apply threshold to create adjacency matrix (undirected graph)
-        adj_matrix = (similarities > self.similarity_threshold).float()
-
-        # Set diagonal to zero (no self-loops)
-        adj_matrix = adj_matrix - torch.eye(adj_matrix.size(0), device=adj_matrix.device) * adj_matrix.diagonal()
-
-        return adj_matrix
-
-    def _compute_laplacian(self, adj_matrix):
-        """
-        Compute the normalized graph Laplacian matrix.
-
-        Parameters:
-        - adj_matrix (torch.Tensor): Adjacency matrix.
-
-        Returns:
-        - torch.Tensor: Normalized Laplacian matrix.
-        """
-        # Compute degree matrix
-        degrees = adj_matrix.sum(dim=1)
-
-        # Add small epsilon to avoid division by zero
-        degrees = degrees + 1e-10
-
-        # Compute D^(-1/2)
-        d_inv_sqrt = torch.pow(degrees, -0.5)
-        d_inv_sqrt_matrix = torch.diag(d_inv_sqrt)
-
-        # Compute normalized Laplacian: L = I - D^(-1/2) A D^(-1/2)
-        laplacian = torch.eye(adj_matrix.size(0), device=adj_matrix.device) - torch.matmul(
-            torch.matmul(d_inv_sqrt_matrix, adj_matrix), d_inv_sqrt_matrix
-        )
-
-        return laplacian
-
-    def _compute_spectral_loss(self, lap1, lap2):
-        """
-        Compute spectral loss between two Laplacian matrices.
-
-        Parameters:
-        - lap1 (torch.Tensor): First Laplacian matrix.
-        - lap2 (torch.Tensor): Second Laplacian matrix.
-
-        Returns:
-        - torch.Tensor: Spectral loss value.
-        """
-        # Compute eigenvalues (sorted in ascending order)
-        eigvals1, _ = torch.linalg.eigh(lap1)
-        eigvals2, _ = torch.linalg.eigh(lap2)
-
-        # Use k smallest eigenvalues (excluding zero eigenvalues if possible)
-        k = min(self.k_eigvals, len(eigvals1) - 1, len(eigvals2) - 1)
-        eigvals1_k = eigvals1[1:k + 1]  # Skip the first eigenvalue (should be zero or near zero)
-        eigvals2_k = eigvals2[1:k + 1]
-
-        # Compute mean squared error between eigenvalues
-        spectral_loss = F.mse_loss(eigvals1_k, eigvals2_k)
-
-        return spectral_loss
-
-    def forward(self, out0, out1, labels=None):
-        """
-        Forward pass to compute the spectral graph matching loss.
-
-        Parameters:
-        - out0 (torch.Tensor): Embeddings from first view, shape (batch_size, embedding_dim).
-        - out1 (torch.Tensor): Embeddings from second view, shape (batch_size, embedding_dim).
-        - labels (torch.Tensor, optional): Class labels for use in distributed gathering.
-
-        Returns:
-        - torch.Tensor: The computed spectral loss.
-        """
-        # Normalize embeddings
-        out0 = F.normalize(out0, dim=1)
-        out1 = F.normalize(out1, dim=1)
-
-        # Handle distributed case
-        if self.use_distributed:
-            out0_large = torch.cat(dist.gather(out0), 0)
-            out1_large = torch.cat(dist.gather(out1), 0)
-        else:
-            out0_large = out0
-            out1_large = out1
-
-        # Construct adjacency matrices
-        adj_matrix1 = self._construct_adjacency_matrix(out0_large)
-        adj_matrix2 = self._construct_adjacency_matrix(out1_large)
-
-        # Compute Laplacian matrices
-        laplacian1 = self._compute_laplacian(adj_matrix1)
-        laplacian2 = self._compute_laplacian(adj_matrix2)
-
-        # Compute spectral loss
-        spectral_loss = self._compute_spectral_loss(laplacian1, laplacian2)
-
-        return spectral_loss
-
-
-class AdaptiveSpectralGraphMatchingLoss(SpectralGraphMatchingLoss):
-    """
-    Adaptive version of the spectral graph matching loss that automatically
-    adjusts the similarity threshold based on batch statistics.
-    """
-
-    def __init__(
-            self,
-            percentile=90,
-            min_edges_percent=10,
-            max_edges_percent=50,
-            temperature=0.5,
-            k_eigvals=10,
-            gather_distributed=False
-    ):
-        """
-        Parameters:
-        - percentile (float): Percentile of similarity values to use as threshold.
-        - min_edges_percent (float): Minimum percentage of edges to maintain.
-        - max_edges_percent (float): Maximum percentage of edges to allow.
-        - temperature (float): Temperature for the similarity calculations.
-        - k_eigvals (int): Number of smallest eigenvalues to use for spectral comparison.
-        - gather_distributed (bool): Whether to gather data across multiple distributed processes.
-        """
-        super(AdaptiveSpectralGraphMatchingLoss, self).__init__(
-            similarity_threshold=0.0,  # Will be determined adaptively
-            temperature=temperature,
-            k_eigvals=k_eigvals,
-            gather_distributed=gather_distributed
-        )
         self.percentile = percentile
         self.min_edges_percent = min_edges_percent / 100.0
         self.max_edges_percent = max_edges_percent / 100.0
 
-    def _adaptive_threshold(self, similarities):
+    def _adaptive_threshold(self, S: torch.Tensor) -> torch.Tensor:
         """
-        Adaptively determine similarity threshold.
-
-        Parameters:
-        - similarities (torch.Tensor): Similarity matrix.
-
-        Returns:
-        - float: Adaptive threshold.
+        Adaptively determine threshold from similarity matrix S.
         """
-        # Flatten the upper triangular part (excluding diagonal)
-        n = similarities.size(0)
-        indices = torch.triu_indices(n, n, 1)
-        sim_values = similarities[indices[0], indices[1]]
+        n = S.size(0)
+        if n < 2:
+            return S.new_tensor(self.similarity_threshold)
 
-        # Compute the threshold based on percentile
+        indices = torch.triu_indices(n, n, offset=1, device=S.device)
+        sim_values = S[indices[0], indices[1]]
+
         threshold = torch.quantile(sim_values, self.percentile / 100.0)
 
-        # Check if the threshold creates too few or too many edges
-        mask = (similarities > threshold).float()
+        # density over off-diagonal entries only
+        mask = (S > threshold).float()
+        mask.fill_diagonal_(0.0)
         edge_density = mask.sum() / (n * (n - 1))
 
         if edge_density < self.min_edges_percent:
-            # Lower threshold to include more edges
             threshold = torch.quantile(sim_values, 1.0 - self.min_edges_percent)
         elif edge_density > self.max_edges_percent:
-            # Raise threshold to include fewer edges
             threshold = torch.quantile(sim_values, 1.0 - self.max_edges_percent)
 
         return threshold
 
-    def _construct_adjacency_matrix(self, embeddings):
+    def _compute_laplacian(self, Z: torch.Tensor) -> torch.Tensor:
         """
-        Construct adjacency matrix with adaptive threshold.
-
-        Parameters:
-        - embeddings (torch.Tensor): Normalized embeddings.
-
-        Returns:
-        - torch.Tensor: Adjacency matrix.
+        Compute random-walk Laplacian:
+            L_rw = I - D^{-1} A
         """
-        # Compute similarity matrix
-        similarities = torch.matmul(embeddings, embeddings.T) / self.temperature
+        S = torch.matmul(Z, Z.T) / self.temperature
 
-        # Determine threshold adaptively
-        threshold = self._adaptive_threshold(similarities)
+        if self.use_adaptive_threshold:
+            threshold = self._adaptive_threshold(S)   
+            A = (S > threshold).float()
+        else:
+            A = (S > self.similarity_threshold).float()
 
-        # Apply threshold to create adjacency matrix
-        adj_matrix = (similarities > threshold).float()
+        A.fill_diagonal_(0.0)
 
-        # Set diagonal to zero (no self-loops)
-        adj_matrix = adj_matrix - torch.eye(adj_matrix.size(0), device=adj_matrix.device) * adj_matrix.diagonal()
+        D = A.sum(dim=1) + 1e-10
+        P = A / D.unsqueeze(1)   # D^{-1} A
+        L = torch.eye(A.size(0), device=A.device, dtype=A.dtype) - P
+        return L
 
-        return adj_matrix
+    def forward(self, Z_i: torch.Tensor, Z_j: torch.Tensor) -> torch.Tensor:
+        """
+        Correct distributed version:
+        build the graph on the global batch across all ranks.
+        """
+        Z_i = F.normalize(Z_i, dim=1)
+        Z_j = F.normalize(Z_j, dim=1)
+
+        # Gather embeddings across all ranks so the graph is global
+        Z_i_all = gather_with_grad(Z_i)
+        Z_j_all = gather_with_grad(Z_j)
+
+        L1 = self._compute_laplacian(Z_i_all)
+        L2 = self._compute_laplacian(Z_j_all)
+
+        loss = ((L1 - L2) ** 2).sum()
+        return loss
