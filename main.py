@@ -407,7 +407,7 @@ def parse_args():
     parser.add_argument("--min_edges_percent", type=float, default=10.0)
     parser.add_argument("--max_edges_percent", type=float, default=50.0)
 
-    parser.add_argument("--eval_after_train", action="store_false")
+    parser.add_argument("--eval_after_train", action="store_true")
     parser.add_argument("--checkpoint_path", type=str, default="checkpoints/last.ckpt")
 
     return parser.parse_args()
@@ -420,7 +420,11 @@ def main():
         if args.dataset not in {"tox21", "toxcast", "sider", "clintox", "muv", "hiv", "bbbp", "bace"}:
             raise ValueError("Transfer downstream dataset must be one of the MoleculeNet graph-level datasets.")
 
-    checkpoint_path = args.checkpoint_path
+    if args.checkpoint_path is not None:
+        checkpoint_path = args.checkpoint_path
+    else:
+        checkpoint_path = train(args)
+
     if args.eval_after_train:
         evaluate(args, checkpoint_path)
 
