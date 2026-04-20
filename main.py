@@ -421,10 +421,7 @@ def main():
             raise ValueError("Transfer downstream dataset must be one of the MoleculeNet graph-level datasets.")
 
     checkpoint_path = args.checkpoint_path
-    if checkpoint_path is None:
-        checkpoint_path = train(args)
-
-    if args.eval_after_train or args.checkpoint_path is not None:
+    if args.eval_after_train:
         evaluate(args, checkpoint_path)
 
 
