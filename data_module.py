@@ -119,6 +119,7 @@ class GraphDataModule(pl.LightningDataModule):
         self.test_dataset = None
         self.train_pair_dataset = None
 
+        # kept for compatibility with eval / downstream logic
         self.labeled_mask = None
         self.labeled_train_dataset = None
         self.unlabeled_train_dataset = None
@@ -213,6 +214,7 @@ class GraphDataModule(pl.LightningDataModule):
             return
 
         if self._is_regular_zinc():
+            # explicit split dataset
             self.train_dataset = ZINC(
                 root=os.path.join(self.root, "zinc"),
                 split="train",
@@ -231,6 +233,7 @@ class GraphDataModule(pl.LightningDataModule):
             self.dataset = self.train_dataset
 
         elif self._is_snap_chem():
+            # pretraining dataset: use whole dataset for contrastive learning
             dataset = MoleculeDataset(
                 root=os.path.join(self.root, "chem", "dataset", "zinc_standard_agent"),
                 dataset="zinc_standard_agent",
@@ -248,13 +251,29 @@ class GraphDataModule(pl.LightningDataModule):
             self.dataset = dataset
 
             if self.mode == "unsupervised":
+                # pretrain on the full dataset
                 self.train_dataset = dataset
                 self.val_dataset = None
                 self.test_dataset = None
+
+            elif self.mode == "semi_supervised":
+                # IMPORTANT:
+                # keep the full dataset and do NOT create val/test splits here.
+                # eval.py will handle K-fold / label-rate protocol itself.
+                self.train_dataset = dataset
+                self.val_dataset = None
+                self.test_dataset = None
+                self.labeled_mask = None
+                self.labeled_train_dataset = None
+                self.unlabeled_train_dataset = None
+
             else:
+                # supervised / downstream usage
                 self.train_dataset, self.val_dataset, self.test_dataset = self._random_split_dataset(dataset)
 
         elif self._is_moleculenet():
+            # treat MoleculeNet downstream tasks as having evaluator-side explicit train/val/test
+            # through this random split stored in the datamodule
             dataset = MoleculeNet(
                 root=os.path.join(self.root, self.dataset_name),
                 name=self.MOLECULENET_NAME_MAP[self.dataset_name],
@@ -265,46 +284,11 @@ class GraphDataModule(pl.LightningDataModule):
         else:
             raise ValueError(f"Unsupported dataset_name for graph-level setting: {self.dataset_name}")
 
-        if self.mode == "semi_supervised":
-            self._apply_semi_supervised_split()
-
         self.train_pair_dataset = ContrastiveDataset(
             self.train_dataset,
             aug1=self.train_aug1,
             aug2=self.train_aug2,
         )
-
-    def _apply_semi_supervised_split(self):
-        if self.dataset_name not in self.TU_SEMISUPERVISED:
-            raise ValueError(
-                "Semi-supervised mode is only configured here for the TU semi-supervised datasets."
-            )
-
-        num_train = len(self.train_dataset)
-        num_labeled = max(1, int(num_train * self.label_rate))
-
-        generator = torch.Generator().manual_seed(self.random_state)
-        perm = torch.randperm(num_train, generator=generator)
-        labeled_local_indices = perm[:num_labeled].tolist()
-        unlabeled_local_indices = perm[num_labeled:].tolist()
-
-        self.labeled_mask = torch.zeros(num_train, dtype=torch.bool)
-        self.labeled_mask[labeled_local_indices] = True
-
-        if isinstance(self.train_dataset, Subset):
-            base_dataset = self.train_dataset.dataset
-            base_indices = list(self.train_dataset.indices)
-
-            labeled_base_indices = [base_indices[i] for i in labeled_local_indices]
-            unlabeled_base_indices = [base_indices[i] for i in unlabeled_local_indices]
-
-            self.labeled_train_dataset = Subset(base_dataset, labeled_base_indices)
-            self.unlabeled_train_dataset = Subset(base_dataset, unlabeled_base_indices)
-        else:
-            self.labeled_train_dataset = Subset(self.train_dataset, labeled_local_indices)
-            self.unlabeled_train_dataset = Subset(self.train_dataset, unlabeled_local_indices)
-
-        self.train_dataset = self.labeled_train_dataset
 
     # ----------------------------
     # Batch formatting
@@ -416,9 +400,7 @@ class TransferDataModule(pl.LightningDataModule):
             raise ValueError(f"Invalid graph-level pretrain dataset: {pretrain_dataset}")
 
         if finetune_dataset not in self.VALID_DOWNSTREAM:
-            raise ValueError(
-                f"Invalid graph-level downstream dataset: {finetune_dataset}"
-            )
+            raise ValueError(f"Invalid graph-level downstream dataset: {finetune_dataset}")
 
         self.pretrain_dm = GraphDataModule(
             dataset_name=pretrain_dataset,

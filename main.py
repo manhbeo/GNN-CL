@@ -66,13 +66,13 @@ class SpecMatchCLTrainer(pl.LightningModule):
 
         if task == "semi_supervised":
             self.contrastive_loss = Supervised_NTXentLoss(
-                temperature=temperature
+                temperature=temperature,
+                gather_distributed=False,  # can change later if you want
             )
         else:
-            # unsupervised and transfer pretraining both use standard NTXent
             self.contrastive_loss = NTXentLoss(
                 temperature=temperature,
-                gather_distributed=True
+                gather_distributed=True,
             )
 
         self.use_specmatch = use_specmatch
@@ -191,7 +191,12 @@ def build_data_module(args):
     raise ValueError(f"Unsupported mode: {args.mode}")
 
 
-def build_lightning_module(args) -> SpecMatchCLTrainer:
+def build_lightning_module(
+    args,
+    *,
+    for_transfer_pretrain: bool = False,
+    for_transfer_downstream_eval: bool = False,
+) -> SpecMatchCLTrainer:
     if args.mode == "unsupervised":
         task = "unsupervised"
         chemistry_mode = False
@@ -206,14 +211,23 @@ def build_lightning_module(args) -> SpecMatchCLTrainer:
 
     elif args.mode == "transfer":
         task = "transfer"
-        chemistry_mode = True
-        use_edge_attr = True
         pooling = "mean"
+
+        if for_transfer_pretrain:
+            # zinc-2m custom chemistry representation
+            chemistry_mode = True
+            use_edge_attr = True
+        elif for_transfer_downstream_eval:
+            # MoleculeNet downstream; safer default
+            chemistry_mode = False
+            use_edge_attr = True
+        else:
+            # default transfer training behavior = pretraining
+            chemistry_mode = True
+            use_edge_attr = True
 
     else:
         raise ValueError(f"Unsupported mode: {args.mode}")
-
-    gather_distributed_supcon = args.devices > 1
 
     return SpecMatchCLTrainer(
         task=task,
@@ -232,7 +246,6 @@ def build_lightning_module(args) -> SpecMatchCLTrainer:
         percentile=args.percentile,
         min_edges_percent=args.min_edges_percent,
         max_edges_percent=args.max_edges_percent,
-        gather_distributed_supcon=gather_distributed_supcon,
     )
 
 
@@ -289,11 +302,11 @@ def train(args) -> str:
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     data_module = build_data_module(args)
-    model = build_lightning_module(args)
     logger = build_logger(args)
     trainer = build_trainer(args, logger)
 
     if args.mode == "transfer":
+        model = build_lightning_module(args, for_transfer_pretrain=True)
         data_module.prepare_data()
         data_module.setup("fit")
         trainer.fit(
@@ -302,6 +315,7 @@ def train(args) -> str:
             val_dataloaders=data_module.pretrain_val_dataloader(),
         )
     else:
+        model = build_lightning_module(args)
         trainer.fit(model, datamodule=data_module)
 
     ckpt_path = trainer.checkpoint_callback.best_model_path
@@ -356,7 +370,11 @@ def evaluate(args, checkpoint_path: str):
     seed_everything(args.seed, workers=True)
 
     data_module = build_data_module(args)
-    model = build_lightning_module(args)
+
+    if args.mode == "transfer":
+        model = build_lightning_module(args, for_transfer_downstream_eval=True)
+    else:
+        model = build_lightning_module(args)
 
     state = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(state["state_dict"], strict=True)
