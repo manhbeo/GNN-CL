@@ -7,8 +7,8 @@ from torch_geometric.loader import DataLoader
 from torch.utils.data import random_split
 from chem_loader import MoleculeDataset
 from bio_loader import BioDataset
-from chem_batch import BatchMasking as ChemBatchMasking
 from bio_batch import BatchMasking as BioBatchMasking
+from chem_batch import BatchMasking as ChemBatchMasking
 from torch_geometric.data import Batch
 
 
